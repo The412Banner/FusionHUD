@@ -37,8 +37,11 @@ enum class FusionSize(val token: String, val label: String) {
 
         // Chip-label ids (must match the labels the config UIs build). "Clock" is a small subtle
         // corner readout available in EVERY size, so it's in all sets.
-        val MINIMAL_CHIPS = setOf("FPS", "FPS graph", "0.01% low", "FPS .1", "Clock")
-        val PILL_CHIPS = setOf("FPS", "FPS graph", "GPU", "CPU", "VRAM", "Battery", "GPU model", "FPS .1", "Clock")
+        // The API/engine label ("Engine" chip) shows on the FPS row in EVERY size, so it's in all sets.
+        // "Wrapper" and "DX ver" are Mega-only: the wrapper appears solely below Mega's frametime graph,
+        // and "DX ver" gates the DX-version suffix on Mega's FPS-row engine label.
+        val MINIMAL_CHIPS = setOf("FPS", "FPS graph", "0.01% low", "FPS .1", "Engine", "Clock")
+        val PILL_CHIPS = setOf("FPS", "FPS graph", "GPU", "CPU", "VRAM", "Battery", "GPU model", "FPS .1", "Engine", "Clock")
         val STANDARD_CHIPS = setOf(
             "FPS", "FPS graph", "GPU", "GPU temp", "CPU", "VRAM", "RAM", "Power", "Temp",
             "Battery", "GPU model", "Engine", "0.01% low", "FPS .1", "Clock",

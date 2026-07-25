@@ -157,6 +157,12 @@ class FusionHudView(
     // ---- Built geometry ---------------------------------------------------
     private class Glyph(val x: Float, val baseline: Float, val text: String, val color: Int, val sizePx: Float)
     private class Span(val text: String, val color: Int, val sizePx: Float)
+    /**
+     * A "label + value-run" row for the aligned grid sizes (Full / Mega). When [inline] is true the row
+     * opts OUT of the shared label column — its value run is placed directly after the label — so a long
+     * label (the graphics-wrapper on the FPS row) can't widen the column and shove every value right.
+     */
+    private class HudRow(val label: Span, val vals: List<Span>, val inline: Boolean = false)
     private val glyphs = ArrayList<Glyph>()
     private val tileRects = ArrayList<RectF>()
     private var pillBorder: RectF? = null
@@ -371,9 +377,18 @@ class FusionHudView(
         else String.format(Locale.US, "%02d:%02d", m, s)
     }
 
-    /** Engine label with the matching DX-wrapper version appended (e.g. "DXVK 2.4.1"), when enabled. */
+    /**
+     * The FPS row's API/engine label — the DX→Vulkan translator ([engineLabel]: "DXVK"/"VKD3D"/"Zink"),
+     * gated by the "Engine" chip. This is short and shows in EVERY size. Falls back to a bare "FPS" when
+     * the toggle is off or no engine label is set. (The graphics WRAPPER is separate — Mega-only, drawn
+     * below the frametime graph — not on the FPS row.)
+     */
+    private fun apiLabel(): String =
+        if (showEngine && engineLabel.isNotBlank()) engineLabel else "FPS"
+
+    /** [apiLabel] with the matching DX-wrapper version appended (e.g. "DXVK 2.4.1"), when [appendVer]. */
     private fun engineLabelWithDx(appendVer: Boolean): String {
-        val base = if (showEngine && engineLabel.isNotBlank()) engineLabel else "FPS"
+        val base = apiLabel()
         if (!appendVer) return base
         val ver = when {
             engineLabel.contains("VKD3D", true) -> vkd3dVersion
@@ -381,6 +396,13 @@ class FusionHudView(
             else -> ""
         }
         return if (ver.isNotBlank()) "$base $ver" else base
+    }
+
+    /** The DX-wrapper version for the current engine, or "" (used for the Tiles "API" tile sub-line). */
+    private fun dxVersion(): String = when {
+        engineLabel.contains("VKD3D", true) -> vkd3dVersion
+        engineLabel.contains("DXVK", true) -> dxvkVersion
+        else -> ""
     }
 
     /** Resolution + refresh, e.g. "1280x720 @ 120Hz". Read from the current display (Main thread). */
@@ -411,17 +433,17 @@ class FusionHudView(
     private fun buildFull(s: HudMetrics.Snapshot) {
         val rowPx = sp(12f); val unitPx = rowPx * 0.62f
         val pad = sp(10f); val lineGap = sp(4f); val lvGap = sp(8f)
-        val rows = ArrayList<Pair<Span, List<Span>>>()
+        val rows = ArrayList<HudRow>()
 
         if (showGpuModel && gpuModel.isNotBlank())
-            rows.add(Span("GPU", colGpu, rowPx) to listOf(Span(gpuModel, colValue, rowPx)))
+            rows.add(HudRow(Span("GPU", colGpu, rowPx), listOf(Span(gpuModel, colValue, rowPx))))
         if (showGPU) {
             val v = ArrayList<Span>()
             v += numUnit(s.gpuPercent?.toString(), "%", rowPx, unitPx)
             if (showGpuTemp) tempSpans(s.gpuTempC, HudMetrics.TempSensor.GPU, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { v += gap(unitPx); v += it } }
             v += gap(unitPx); v += numUnit(s.gpuClockMhz?.toString(), "MHz", rowPx, unitPx)
-            rows.add(Span("GPU", colGpu, rowPx) to v)
+            rows.add(HudRow(Span("GPU", colGpu, rowPx), v))
         }
         if (showCPU) {
             val v = ArrayList<Span>()
@@ -429,15 +451,15 @@ class FusionHudView(
             if (showCpuTemp) tempSpans(s.cpuTempC, HudMetrics.TempSensor.CPU, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { v += gap(unitPx); v += it } }
             v += gap(unitPx); v += numUnit(s.cpuClockMhz?.toString(), "MHz", rowPx, unitPx)
-            rows.add(Span("CPU", colCpu, rowPx) to v)
+            rows.add(HudRow(Span("CPU", colCpu, rowPx), v))
         }
         if (showVram && s.vramText() != null)
-            rows.add(Span("VRAM", colVram, rowPx) to valueUnit(s.vramText()!!, rowPx, unitPx))
+            rows.add(HudRow(Span("VRAM", colVram, rowPx), valueUnit(s.vramText()!!, rowPx, unitPx)))
         if (showRAM) {
             val v = ArrayList<Span>()
             v += valueUnit(s.ramUsedText(), rowPx, unitPx)
             v += gap(unitPx); v += numUnit(s.ramPercent.roundToInt().toString(), "%", rowPx, unitPx)
-            rows.add(Span("RAM", colRam, rowPx) to v)
+            rows.add(HudRow(Span("RAM", colRam, rowPx), v))
         }
         if (showBattery || showPower || showBatteryTemp) {
             val v = ArrayList<Span>(); var any = false
@@ -445,39 +467,45 @@ class FusionHudView(
             if (showBatteryTemp) tempSpans(s.battery.tempC, HudMetrics.TempSensor.BATTERY, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { if (any) v += gap(unitPx); v += it; any = true } }
             if (showPower && s.battery.watts > 0f) { if (any) v += gap(unitPx); v += numUnit(fmt1(s.battery.watts), "W", rowPx, unitPx); any = true }
-            if (any) rows.add(Span("BAT", colBat, rowPx) to v)
+            if (any) rows.add(HudRow(Span("BAT", colBat, rowPx), v))
         }
         if (showFPS) {
-            val label = if (showEngine && engineLabel.isNotBlank()) engineLabel else "FPS"
             val v = ArrayList<Span>()
             v += numUnit(fpsText(fpsNow), "FPS", rowPx, unitPx)
             v += gap(unitPx); v += numUnit(fmt1(1000f / max(fpsNow, 1f)), "ms", rowPx, unitPx)
-            rows.add(Span(label, colFps, rowPx) to v)
-            rows.add(Span("AVG", colLo, rowPx) to numUnit(fmt1(fpsAvg), "FPS", rowPx, unitPx))
-            rows.add(Span("1%", colLo, rowPx) to numUnit(lowText(lows.low1Fps), "FPS", rowPx, unitPx))
-            rows.add(Span("0.1%", colLo, rowPx) to numUnit(lowText(lows.low01Fps), "FPS", rowPx, unitPx))
+            // Short API/engine label ("DXVK"/"VKD3D"/"Zink", else "FPS") — a normal aligned row.
+            rows.add(HudRow(Span(apiLabel(), colFps, rowPx), v))
+            rows.add(HudRow(Span("AVG", colLo, rowPx), numUnit(fmt1(fpsAvg), "FPS", rowPx, unitPx)))
+            rows.add(HudRow(Span("1%", colLo, rowPx), numUnit(lowText(lows.low1Fps), "FPS", rowPx, unitPx)))
+            rows.add(HudRow(Span("0.1%", colLo, rowPx), numUnit(lowText(lows.low01Fps), "FPS", rowPx, unitPx)))
             if (showLow001)
-                rows.add(Span("0.01%", colLo, rowPx) to numUnit(lowText(lows.low001Fps), "FPS", rowPx, unitPx))
+                rows.add(HudRow(Span("0.01%", colLo, rowPx), numUnit(lowText(lows.low001Fps), "FPS", rowPx, unitPx)))
         }
 
         var labelCol = 0f
-        for ((lab, _) in rows) labelCol = max(labelCol, measure(lab.text, rowPx))
+        for (r in rows) if (!r.inline) labelCol = max(labelCol, measure(r.label.text, rowPx))
         val h = lineH(rowPx); val asc = ascent(rowPx)
         var y = pad; var maxRight = pad
-        for ((lab, vals) in rows) {
+        for (r in rows) {
             val baseline = y - asc
-            placeRun(pad, baseline, listOf(lab))
-            val end = placeRun(pad + labelCol + lvGap, baseline, vals)
+            placeRun(pad, baseline, listOf(r.label))
+            val valX = if (r.inline) pad + measure(r.label.text, rowPx) + lvGap
+                       else pad + labelCol + lvGap
+            val end = placeRun(valX, baseline, r.vals)
             maxRight = max(maxRight, end)
             y += h + lineGap
         }
 
         if (showFPS && showGraph) {
-            // Frametime min/max line + green graph.
+            // Frametime min/max line + green graph. "Frametime" is far wider than the short-label grid
+            // column, so place the stat AFTER the ACTUAL label width (not labelCol) — otherwise the two
+            // overlap and render as "Frametimemin:.. max:..".
+            val ftPx = unitPx * 1.15f
             val baseline = y - asc
-            placeRun(pad, baseline, listOf(Span("Frametime", colFps, unitPx * 1.15f)))
+            placeRun(pad, baseline, listOf(Span("Frametime", colFps, ftPx)))
             val stat = "min:${fmt1(lows.minMs)} max:${fmt1(lows.maxMs)}"
-            val end = placeRun(pad + labelCol + lvGap, baseline, listOf(Span(stat, colDim, unitPx)))
+            val statX = pad + max(labelCol, measure("Frametime", ftPx)) + lvGap
+            val end = placeRun(statX, baseline, listOf(Span(stat, colDim, unitPx)))
             maxRight = max(maxRight, end)
             y += h + lineGap
             val gh = sp(22f)
@@ -512,6 +540,11 @@ class FusionHudView(
         if (showVram && s.vramText() != null) tiles.add(Tile("VRAM", colVram, valueUnit(s.vramText()!!, valPx, unitPx), null, false))
         if (showRAM) tiles.add(Tile("RAM", colRam, numUnit(s.ramPercent.roundToInt().toString(), "%", valPx, unitPx),
             "${s.ramUsedText()} / ${s.ramTotalText()}", false))
+        // API/engine tile — short translator name (DXVK/VKD3D/Zink) with the DX version on the sub-line;
+        // a normal half-width tile that naturally fills the empty slot beside RAM. Gated by "Engine".
+        if (showEngine && engineLabel.isNotBlank())
+            tiles.add(Tile("API", colFps, listOf(Span(engineLabel, colValue, valPx)),
+                dxVersion().ifBlank { null }, false))
         if (showGpuModel && gpuModel.isNotBlank())
             tiles.add(Tile("GPU", colGpu, listOf(Span(gpuModel, colValue, valPx)), null, true))
         if (showBattery || showPower || showBatteryTemp) {
@@ -590,25 +623,39 @@ class FusionHudView(
             if (any) stack.add(l)
         }
 
+        // Left column: a small API/engine caption (DXVK/VKD3D/Zink) centred ABOVE the big FPS — mirroring
+        // the clock centred BELOW it, so the left reads API · FPS · clock top-to-bottom.
+        val apiStr = apiLabel()
+        val hasApi = apiStr != "FPS"
+        val apiH = if (hasApi) lineH(stkPx) else 0f
+        val apiGap = if (hasApi) stkLineGap else 0f
+
         val leftW = runWidth(left); val leftH = lineH(bigPx)
+        val apiW = if (hasApi) measure(apiStr, stkPx) else 0f
+        val leftBlockW = max(leftW, apiW)
+        val leftColH = apiH + apiGap + leftH
         val stkH = lineH(stkPx)
         var stackW = 0f
         for (l in stack) stackW = max(stackW, runWidth(l))
         val stackTotalH = stack.size * stkH + (stack.size - 1).coerceAtLeast(0) * stkLineGap
-        val innerH = max(leftH, stackTotalH)
-        contentW = pad + leftW + midGap + stackW + pad
+        val innerH = max(leftColH, stackTotalH)
+        contentW = pad + leftBlockW + midGap + stackW + pad
         contentH = pad + innerH + pad
 
-        // left big, vertically centered
-        val leftBaseline = pad + (innerH - leftH) / 2f - ascent(bigPx)
-        placeRun(pad, leftBaseline, left)
+        // left column (API caption + big FPS), vertically centered as a block
+        var ly = pad + (innerH - leftColH) / 2f
+        if (hasApi) {
+            placeRun(pad + (leftBlockW - apiW) / 2f, ly - ascent(stkPx), listOf(Span(apiStr, colFps, stkPx)))
+            ly += apiH + apiGap
+        }
+        placeRun(pad + (leftBlockW - leftW) / 2f, ly - ascent(bigPx), left)
         // stack, vertically centered
         var sy = pad + (innerH - stackTotalH) / 2f
         for (l in stack) {
-            placeRun(pad + leftW + midGap, sy - ascent(stkPx), l)
+            placeRun(pad + leftBlockW + midGap, sy - ascent(stkPx), l)
             sy += stkH + stkLineGap
         }
-        addSubtleClock(pad, pad + leftW / 2f)   // clock centred under the FPS (left of the pill centre)
+        addSubtleClock(pad, pad + leftBlockW / 2f)   // clock centred under the FPS (left of the pill centre)
         // Capsule border captured AFTER the footer clock so the pill encloses it too.
         pillBorder = RectF(0f, 0f, contentW, contentH)
     }
@@ -624,7 +671,6 @@ class FusionHudView(
         if (showLow001) {
             sub += Span("  ·  0.01% ", colDim, subPx); sub += Span(lowText(lows.low001Fps) ?: "—", colFps, subPx)
         }
-
         val bigW = runWidth(big); val bigH = lineH(bigPx)
         val subW = runWidth(sub); val subH = lineH(subPx)
         val gw = sp(120f); val gh = sp(22f)
@@ -643,21 +689,37 @@ class FusionHudView(
             y += gh
         }
         contentH = y + pad
+        // Small API/engine label (DXVK/VKD3D/Zink), bottom-LEFT, near the graph — balances the subtle
+        // clock on the bottom-right (both share the same footer line). Gated by the "Engine" chip. Placed
+        // BEFORE addSubtleClock so both read the same footerTop (= contentH - pad).
+        if (showEngine && engineLabel.isNotBlank()) {
+            val apiPx = sp(9.5f)
+            val footerTop = contentH - pad
+            glyphs.add(Glyph(pad, footerTop - ascent(apiPx), engineLabel, blend(colDim), apiPx))
+            val apiW = measure(engineLabel, apiPx)
+            val clockW = if (showClockTime) measure(clockTimeString(), apiPx) else 0f
+            contentW = max(contentW, pad + apiW + sp(12f) + clockW + pad)
+            // The clock (when shown) grows contentH for the footer line; when it's hidden, do it here.
+            if (!showClockTime) contentH = footerTop + lineH(apiPx) + pad * 0.5f
+        }
         addSubtleClock(pad)
     }
 
-    /** Places a column of "label + value" rows; returns (bottomY, rightX). Appends glyphs. */
-    private fun layoutColumn(rows: List<Pair<Span, List<Span>>>, x: Float, y0: Float,
+    /** Places a column of "label + value" rows; returns (bottomY, rightX). Appends glyphs. Rows flagged
+     *  [HudRow.inline] opt out of the shared label column (value follows the label directly). */
+    private fun layoutColumn(rows: List<HudRow>, x: Float, y0: Float,
                              rowPx: Float, lineGap: Float, lvGap: Float): Pair<Float, Float> {
         if (rows.isEmpty()) return Pair(y0, x)
         var labelCol = 0f
-        for ((lab, _) in rows) labelCol = max(labelCol, measure(lab.text, rowPx))
+        for (r in rows) if (!r.inline) labelCol = max(labelCol, measure(r.label.text, rowPx))
         val h = lineH(rowPx); val asc = ascent(rowPx)
         var y = y0; var right = x
-        for ((lab, vals) in rows) {
+        for (r in rows) {
             val baseline = y - asc
-            placeRun(x, baseline, listOf(lab))
-            val end = placeRun(x + labelCol + lvGap, baseline, vals)
+            placeRun(x, baseline, listOf(r.label))
+            val valX = if (r.inline) x + measure(r.label.text, rowPx) + lvGap
+                       else x + labelCol + lvGap
+            val end = placeRun(valX, baseline, r.vals)
             right = max(right, end)
             y += h + lineGap
         }
@@ -686,16 +748,16 @@ class FusionHudView(
         val pad = sp(10f); val lineGap = sp(3.5f); val lvGap = sp(7f); val gutter = sp(16f)
 
         // ---- LEFT column: GPU, aggregate CPU, then per-core rows ----
-        val left = ArrayList<Pair<Span, List<Span>>>()
+        val left = ArrayList<HudRow>()
         if (showGpuModel && gpuModel.isNotBlank())
-            left.add(Span("GPU", colGpu, rowPx) to listOf(Span(gpuModel, colValue, rowPx)))
+            left.add(HudRow(Span("GPU", colGpu, rowPx), listOf(Span(gpuModel, colValue, rowPx))))
         if (showGPU) {
             val v = ArrayList<Span>()
             v += numUnit(s.gpuPercent?.toString(), "%", rowPx, unitPx)
             if (showGpuTemp) tempSpans(s.gpuTempC, HudMetrics.TempSensor.GPU, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { v += gap(unitPx); v += it } }
             v += gap(unitPx); v += numUnit(s.gpuClockMhz?.toString(), "MHz", rowPx, unitPx)
-            left.add(Span("GPU", colGpu, rowPx) to v)
+            left.add(HudRow(Span("GPU", colGpu, rowPx), v))
         }
         if (showCPU) {
             val v = ArrayList<Span>()
@@ -703,7 +765,7 @@ class FusionHudView(
             if (showCpuTemp) tempSpans(s.cpuTempC, HudMetrics.TempSensor.CPU, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { v += gap(unitPx); v += it } }
             v += gap(unitPx); v += numUnit(s.cpuClockMhz?.toString(), "MHz", rowPx, unitPx)
-            left.add(Span("CPU", colCpu, rowPx) to v)
+            left.add(HudRow(Span("CPU", colCpu, rowPx), v))
         }
         if (showPerCore) {
             val pct = s.perCorePercent; val clk = s.perCoreClockMhz
@@ -713,26 +775,26 @@ class FusionHudView(
                 v += numUnit(if (i < pct.size && pct[i] >= 0) pct[i].toString() else null, "%", rowPx, unitPx)
                 v += gap(unitPx)
                 v += numUnit(if (i < clk.size && clk[i] > 0) clk[i].toString() else null, "MHz", rowPx, unitPx)
-                left.add(Span("C$i", colCpu, rowPx) to v)
+                left.add(HudRow(Span("C$i", colCpu, rowPx), v))
             }
         }
 
         // ---- RIGHT column: VRAM, RAM, SWP, NET, BAT, engine, lows ----
-        val right = ArrayList<Pair<Span, List<Span>>>()
+        val right = ArrayList<HudRow>()
         if (showVram && s.vramText() != null)
-            right.add(Span("VRAM", colVram, rowPx) to valueUnit(s.vramText()!!, rowPx, unitPx))
+            right.add(HudRow(Span("VRAM", colVram, rowPx), valueUnit(s.vramText()!!, rowPx, unitPx)))
         if (showRAM) {
             val v = ArrayList<Span>()
             v += valueUnit(s.ramUsedText(), rowPx, unitPx)
             v += Span("/", colDim, unitPx); v += valueUnit(s.ramTotalText(), rowPx, unitPx)
             v += gap(unitPx); v += numUnit(s.ramPercent.roundToInt().toString(), "%", rowPx, unitPx)
-            right.add(Span("RAM", colRam, rowPx) to v)
+            right.add(HudRow(Span("RAM", colRam, rowPx), v))
         }
         if (showSwap && s.swapUsedText() != null) {
             val v = ArrayList<Span>()
             v += valueUnit(s.swapUsedText()!!, rowPx, unitPx)
             s.swapTotalText()?.let { v += Span("/", colDim, unitPx); v += valueUnit(it, rowPx, unitPx) }
-            right.add(Span("SWP", colRam, rowPx) to v)
+            right.add(HudRow(Span("SWP", colRam, rowPx), v))
         }
         if (showNet && s.netDownBps != null) {
             val d = (s.netDownBps ?: 0L) / 1024L
@@ -741,7 +803,7 @@ class FusionHudView(
             v += Span("↓", colDim, unitPx); v += Span(d.toString(), colValue, rowPx)
             v += Span(" ↑", colDim, unitPx); v += Span(u.toString(), colValue, rowPx)
             v += Span("KB/s", colDim, unitPx)
-            right.add(Span("NET", colFps, rowPx) to v)
+            right.add(HudRow(Span("NET", colFps, rowPx), v))
         }
         if (showBattery || showPower || showBatteryTemp) {
             val v = ArrayList<Span>(); var any = false
@@ -749,18 +811,19 @@ class FusionHudView(
             if (showBatteryTemp) tempSpans(s.battery.tempC, HudMetrics.TempSensor.BATTERY, rowPx, unitPx)
                 .let { if (it.isNotEmpty()) { if (any) v += gap(unitPx); v += it; any = true } }
             if (showPower && s.battery.watts > 0f) { if (any) v += gap(unitPx); v += numUnit(fmt1(s.battery.watts), "W", rowPx, unitPx); any = true }
-            if (any) right.add(Span("BAT", colBat, rowPx) to v)
+            if (any) right.add(HudRow(Span("BAT", colBat, rowPx), v))
         }
         if (showFPS) {
             val v = ArrayList<Span>()
             v += numUnit(fpsText(fpsNow), "FPS", rowPx, unitPx)
             v += gap(unitPx); v += numUnit(fmt1(1000f / max(fpsNow, 1f)), "ms", rowPx, unitPx)
-            right.add(Span(engineLabelWithDx(showDxVer), colFps, rowPx) to v)
-            right.add(Span("AVG", colLo, rowPx) to numUnit(fmt1(fpsAvg), "FPS", rowPx, unitPx))
-            right.add(Span("1%", colLo, rowPx) to numUnit(lowText(lows.low1Fps), "FPS", rowPx, unitPx))
-            right.add(Span("0.1%", colLo, rowPx) to numUnit(lowText(lows.low01Fps), "FPS", rowPx, unitPx))
+            // FPS/engine row: short API label + DX version (gated by "DX ver" / showDxVer).
+            right.add(HudRow(Span(engineLabelWithDx(showDxVer), colFps, rowPx), v))
+            right.add(HudRow(Span("AVG", colLo, rowPx), numUnit(fmt1(fpsAvg), "FPS", rowPx, unitPx)))
+            right.add(HudRow(Span("1%", colLo, rowPx), numUnit(lowText(lows.low1Fps), "FPS", rowPx, unitPx)))
+            right.add(HudRow(Span("0.1%", colLo, rowPx), numUnit(lowText(lows.low01Fps), "FPS", rowPx, unitPx)))
             if (showLow001)
-                right.add(Span("0.01%", colLo, rowPx) to numUnit(lowText(lows.low001Fps), "FPS", rowPx, unitPx))
+                right.add(HudRow(Span("0.01%", colLo, rowPx), numUnit(lowText(lows.low001Fps), "FPS", rowPx, unitPx)))
         }
 
         // ---- Two columns side by side (each reflows independently) ----
@@ -770,11 +833,11 @@ class FusionHudView(
         var y = max(leftBottom, rightBottom)
         var maxRight = max(leftRight, rightRight)
 
-        // ---- Bottom band spanning both columns: res · Proton · wrapper · elapsed ----
+        // ---- Bottom band spanning both columns: res · Proton · elapsed ----
+        // (The graphics wrapper moved to the FPS-row label above, so it's no longer in this band.)
         val band = ArrayList<List<Span>>()
         if (showResolution) band.add(listOf(Span("RES ", colDim, bandPx), Span(resolutionString(), colValue, bandPx)))
         if (showProton && wineVersion.isNotBlank()) band.add(listOf(Span(wineVersion, colVram, bandPx)))
-        if (showWrapper && graphicsWrapper.isNotBlank()) band.add(listOf(Span(graphicsWrapper, colGpu, bandPx)))
         if (showSession) band.add(listOf(Span("elapsed ", colDim, bandPx), Span(elapsedString(), colValue, bandPx)))
         if (band.isNotEmpty()) {
             y += sp(4f)
@@ -790,6 +853,15 @@ class FusionHudView(
             graphRect = RectF(pad, y, gr, y + gh)
             maxRight = max(maxRight, gr)
             y += gh
+        }
+
+        // ---- Graphics wrapper — the ONLY place it appears. A subtle line BELOW the frametime graph,
+        // same size/style as the bottom band, as a visual continuation (e.g. "GameNative 20260719"). ----
+        if (showWrapper && graphicsWrapper.isNotBlank()) {
+            y += sp(4f)
+            val end = placeRun(pad, y - ascent(bandPx), listOf(Span(graphicsWrapper, colDim, bandPx)))
+            maxRight = max(maxRight, end)
+            y += lineH(bandPx)
         }
 
         contentW = maxRight + pad
