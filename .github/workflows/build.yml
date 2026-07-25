@@ -1,0 +1,43 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build library (release AAR) + demo (debug APK)
+        run: ./gradlew :fusionhud:assembleRelease :demo:assembleDebug --stacktrace
+
+      - name: Upload demo APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusionhud-demo-debug
+          path: demo/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Upload library AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusionhud-release-aar
+          path: fusionhud/build/outputs/aar/*.aar
+          if-no-files-found: warn

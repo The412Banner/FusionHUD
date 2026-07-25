@@ -1,0 +1,13 @@
+// Top-level build file. Plugins are declared here (apply false) and applied per-module.
+// AGP + Kotlin versions mirror Bannerlator's toolchain (AGP 8.8.0, Kotlin 2.0.21).
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.8.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21'
+    }
+}
