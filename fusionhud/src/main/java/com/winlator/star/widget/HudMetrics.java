@@ -19,12 +19,17 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.BatteryManager;
+import android.os.Build;
 import android.os.SystemClock;
+
+import com.winlator.star.core.GPUInformation;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -152,30 +157,33 @@ public class HudMetrics {
         if (gpuUsagePathsCache != null) return gpuUsagePathsCache;
         LinkedHashSet<String> candidates = new LinkedHashSet<>();
 
-        String[] staticPaths = {
-            "/sys/class/kgsl/kgsl-3d0/gpubusy",
-            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
-            "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
-            "/sys/class/misc/mali0/device/utilisation",
-            "/sys/class/misc/mali0/device/utilization",
-            "/sys/class/misc/mali0/device/gpuinfo",
-            "/sys/devices/platform/mali/utilization",
-            "/sys/kernel/gpu/gpu_busy",
-            "/sys/class/misc/pvrsrvkm/device/utilisation",
-            "/sys/class/devfreq/gpu/load",
-        };
-        for (String p : staticPaths) {
+        for (String p : GPU_USAGE_STATIC_PATHS) {
             if (new File(p).canRead()) candidates.add(p);
+        }
+
+        // Vendor platform nodes with hashed/addressed names we can't hard-code (e.g.
+        // /sys/devices/platform/13000000.mali/utilisation, .../gpusysfs/gpu_busy, panfrost, sgpu).
+        File platformDir = new File("/sys/devices/platform");
+        File[] platformNodes = platformDir.listFiles(File::isDirectory);
+        if (platformNodes != null) {
+            for (File node : platformNodes) {
+                String name = node.getName().toLowerCase(Locale.US);
+                boolean looksLikeGpu = false;
+                for (String t : GPU_NODE_TOKENS) {
+                    if (name.contains(t)) { looksLikeGpu = true; break; }
+                }
+                if (!looksLikeGpu) continue;
+                for (String fileName : GPU_USAGE_FILES) {
+                    File f = new File(node, fileName);
+                    if (f.canRead()) candidates.add(f.getPath());
+                }
+            }
         }
 
         File[] devfreqRoots = {
             new File("/sys/class/devfreq"),
             new File("/sys/devices/virtual/devfreq"),
         };
-        String[] usageFiles = {
-            "gpu_busy_percentage", "gpu_load", "utilisation", "utilization", "load", "gpuinfo",
-        };
-        String[] gpuTokens = {"gpu", "mali", "g3d", "kgsl"};
         for (File root : devfreqRoots) {
             if (!root.isDirectory()) continue;
             File[] nodeDirs = root.listFiles(File::isDirectory);
@@ -183,13 +191,14 @@ public class HudMetrics {
             for (File node : nodeDirs) {
                 String nodePath = node.getPath().toLowerCase(Locale.US);
                 boolean looksLikeGpu = false;
-                for (String t : gpuTokens) {
+                for (String t : GPU_NODE_TOKENS) {
                     if (nodePath.contains(t)) { looksLikeGpu = true; break; }
                 }
-                for (String fileName : usageFiles) {
+                for (String fileName : GPU_USAGE_FILES) {
                     File f = new File(node, fileName);
                     if (!f.canRead()) continue;
-                    if (looksLikeGpu || fileName.equals("gpu_busy_percentage") || fileName.equals("gpuinfo")) {
+                    if (looksLikeGpu || fileName.equals("gpu_busy_percentage")
+                            || fileName.equals("gpu_busy_percent") || fileName.equals("gpuinfo")) {
                         candidates.add(f.getPath());
                     }
                 }
@@ -199,6 +208,35 @@ public class HudMetrics {
         gpuUsagePathsCache = new ArrayList<>(candidates);
         return gpuUsagePathsCache;
     }
+
+    // Ordered, world-readable-when-present GPU utilisation nodes across the vendors we've seen:
+    // Adreno KGSL, Mali (misc + Exynos vendor), PowerVR, and amdgpu-style sysfs (Samsung Xclipse /
+    // "sgpu", AMD-on-Exynos). readGpuUsageSample() knows how to parse each filename shape.
+    private static final String[] GPU_USAGE_STATIC_PATHS = {
+        "/sys/class/kgsl/kgsl-3d0/gpubusy",
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
+        "/sys/class/misc/mali0/device/utilisation",
+        "/sys/class/misc/mali0/device/utilization",
+        "/sys/class/misc/mali0/device/gpuinfo",
+        "/sys/devices/platform/mali/utilization",
+        "/sys/kernel/gpu/gpu_busy",
+        "/sys/devices/platform/gpusysfs/gpu_busy",   // Exynos Mali vendor node
+        "/sys/class/misc/pvrsrvkm/device/utilisation",
+        "/sys/class/pvr/utilisation",                // PowerVR (Rogue) sysfs
+        "/sys/class/pvr/gpu_utilisation",
+        "/sys/class/drm/card0/device/gpu_busy_percent", // amdgpu / Xclipse (sgpu), 0..100
+        "/sys/class/devfreq/gpu/load",
+    };
+    // Percent-bearing filenames scanned under each devfreq / platform GPU node.
+    private static final String[] GPU_USAGE_FILES = {
+        "gpu_busy_percentage", "gpu_busy_percent", "gpu_load", "utilisation", "utilization",
+        "load", "gpu_busy", "gpuinfo",
+    };
+    // Substrings that mark a devfreq / platform node as the GPU, across vendors.
+    private static final String[] GPU_NODE_TOKENS = {
+        "gpu", "mali", "g3d", "kgsl", "panfrost", "pvr", "powervr", "xclipse", "sgpu",
+    };
 
     private Integer readGpuUsageSample(String path) {
         String fileName = path.substring(path.lastIndexOf('/') + 1);
@@ -302,13 +340,16 @@ public class HudMetrics {
 
     private List<String> discoverPrioritizedCpuTempPaths() {
         return prioritizePaths(type -> {
+            if (type.contains("gpu")) return null;                 // never mistake a GPU zone for CPU
             if (type.contains("cpu-silicon")) return 0;
             if (type.contains("cpu-0")) return 1;
-            if (type.contains("cpu") && !type.contains("gpu")) return 2;
-            if (type.contains("soc")) return 3;
-            if (type.contains("s5p-tmu")) return 4;
+            if (type.contains("cpuss")) return 2;                  // Qualcomm cpuss composite
+            if (type.contains("mtktscpu")) return 2;               // MediaTek CPU thermal
+            if (type.contains("cpu")) return 2;                    // cpu, cpu-*-usr, cpu_thermal, cpu_center
+            if (type.contains("s5p-tmu")) return 3;                // Exynos TMU
+            if (type.contains("soc")) return 4;
             if (type.contains("cputop")) return 5;
-            if (type.contains("tsens")) return 6;
+            if (type.contains("tsens")) return 6;                  // Qualcomm tsens aggregate
             if (type.contains("cluster")) return 7;
             if (type.contains("big") || type.contains("little")) return 8;
             return null;
@@ -318,10 +359,14 @@ public class HudMetrics {
     private List<String> discoverPrioritizedGpuTempPaths() {
         return prioritizePaths(type -> {
             if (type.contains("gpu-silicon")) return 0;
-            if (type.contains("gpu")) return 1;
-            if (type.contains("g3d")) return 2;
-            if (type.contains("kgsl")) return 3;
-            if (type.contains("mali")) return 4;
+            if (type.contains("gpuss")) return 1;                  // Qualcomm gpuss
+            if (type.contains("mtktsgpu")) return 1;               // MediaTek GPU thermal
+            if (type.contains("gpu-virt")) return 2;
+            if (type.contains("gpu")) return 2;
+            if (type.contains("g3d")) return 3;                    // Exynos Mali (g3d)
+            if (type.contains("kgsl")) return 4;
+            if (type.contains("mali")) return 5;
+            if (type.contains("xclipse") || type.contains("sgpu")) return 6;
             return null;
         });
     }
@@ -721,17 +766,42 @@ public class HudMetrics {
         "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",   // Adreno devfreq, Hz
         "/sys/class/kgsl/kgsl-3d0/clock_mhz",          // some kernels, already MHz
         "/sys/kernel/gpu/gpu_clock",                   // Mali vendor node, MHz
+        "/sys/devices/platform/gpusysfs/gpu_clock",    // Exynos Mali vendor node, MHz
+        "/sys/class/misc/mali0/device/clock",          // Mali, kHz/MHz
         "/sys/class/devfreq/gpu/cur_freq",             // generic devfreq gpu, Hz
     };
 
+    private List<String> discoverGpuClockPaths() {
+        if (gpuClockPathsCache != null) return gpuClockPathsCache;
+        LinkedHashSet<String> found = new LinkedHashSet<>();
+        for (String p : GPU_CLOCK_PATHS) if (new File(p).canRead()) found.add(p);
+        // Vendor-agnostic devfreq walk: any gpu/mali/panfrost/xclipse/sgpu node's cur_freq (Hz).
+        File[] devfreqRoots = {
+            new File("/sys/class/devfreq"),
+            new File("/sys/devices/virtual/devfreq"),
+        };
+        for (File root : devfreqRoots) {
+            if (!root.isDirectory()) continue;
+            File[] nodeDirs = root.listFiles(File::isDirectory);
+            if (nodeDirs == null) continue;
+            for (File node : nodeDirs) {
+                String nodePath = node.getPath().toLowerCase(Locale.US);
+                boolean looksLikeGpu = false;
+                for (String t : GPU_NODE_TOKENS) {
+                    if (nodePath.contains(t)) { looksLikeGpu = true; break; }
+                }
+                if (!looksLikeGpu) continue;
+                File f = new File(node, "cur_freq");
+                if (f.canRead()) found.add(f.getPath());
+            }
+        }
+        gpuClockPathsCache = new ArrayList<>(found);
+        return gpuClockPathsCache;
+    }
+
     /** GPU clock in MHz (Adreno KGSL / devfreq / Mali nodes), or null when no source reports it. */
     public Integer getGpuClockMhz() {
-        if (gpuClockPathsCache == null) {
-            ArrayList<String> found = new ArrayList<>();
-            for (String p : GPU_CLOCK_PATHS) if (new File(p).canRead()) found.add(p);
-            gpuClockPathsCache = found;
-        }
-        for (String p : gpuClockPathsCache) {
+        for (String p : discoverGpuClockPaths()) {
             Long raw = readLongFromLine(p);
             if (raw == null || raw <= 0) continue;
             long mhz;
@@ -744,16 +814,31 @@ public class HudMetrics {
     }
 
     // =======================================================================
-    // VRAM (best-effort — Adreno KGSL sysfs only, Java-only, no native rebuild)
+    // VRAM (best-effort, Java-only sysfs — no native rebuild)
     // =======================================================================
-    // TODO: VK_EXT_memory_budget for non-Adreno (Mali/others) — needs a native/Vulkan path, out of
-    // scope for the Java-only pass. Devices with no readable node return null and the HUD hides VRAM.
+    // Covered here in pure Java: Adreno KGSL (bytes mapped/allocated) and amdgpu-style drm nodes
+    // (Samsung Xclipse / "sgpu", AMD-on-Exynos), which expose mem_info_vram_used/_total directly.
+    // TODO(native): VK_EXT_memory_budget as a vendor-agnostic fallback for Mali/PowerVR, which expose
+    // no world-readable VRAM node. FEASIBILITY (checked 2026-07): the compositor's Vulkan layer
+    // (app/src/main/cpp/winlator/vulkan.c) creates an EPHEMERAL VkInstance/VkPhysicalDevice inside
+    // getRenderer() and destroys it every call — it holds no reusable device and loads only the
+    // properties/extension entrypoints, not vkGetPhysicalDeviceMemoryProperties2. Wiring the budget
+    // query therefore means a new JNI method + enabling VK_KHR_get_physical_device_properties2 /
+    // VK_EXT_memory_budget at instance create + an NDK rebuild — out of scope for a source-only pass.
+    // CAVEAT to document if/when added: this HUD is an app-side overlay, NOT in the game's Vulkan
+    // device, so an app-created instance reports the DEVICE-WIDE heap budget (a GPU-memory-pressure
+    // proxy), not the game's per-process VRAM. Devices with no readable node return null → HUD hides VRAM.
     private List<String> vramUsedPathsCache = null;
     private static final String[] VRAM_USED_PATHS = {
-        "/sys/class/kgsl/kgsl-3d0/gpumem_mapped",   // bytes currently mapped to the GPU
-        "/sys/class/kgsl/kgsl-3d0/page_alloc",      // bytes allocated to the KGSL page pool
-        "/sys/class/kgsl/kgsl-3d0/mapped",          // alt name on some kernels
-        "/sys/class/kgsl/kgsl-3d0/page_alloc_max",  // high-water fallback
+        "/sys/class/kgsl/kgsl-3d0/gpumem_mapped",        // bytes currently mapped to the GPU
+        "/sys/class/kgsl/kgsl-3d0/page_alloc",           // bytes allocated to the KGSL page pool
+        "/sys/class/kgsl/kgsl-3d0/mapped",               // alt name on some kernels
+        "/sys/class/drm/card0/device/mem_info_vram_used",// amdgpu / Xclipse (sgpu), bytes
+        "/sys/class/kgsl/kgsl-3d0/page_alloc_max",       // high-water fallback
+    };
+    // Total-VRAM companions (amdgpu exposes one; used only by the diagnostics report).
+    private static final String[] VRAM_TOTAL_PATHS = {
+        "/sys/class/drm/card0/device/mem_info_vram_total",
     };
 
     /** Used GPU memory in bytes from Adreno KGSL sysfs, or null when this device exposes nothing readable. */
@@ -1006,6 +1091,265 @@ public class HudMetrics {
         long down = Math.max(0L, (rx - prevRx) * 1000L / dt);
         long up = Math.max(0L, (tx - prevTx) * 1000L / dt);
         return new long[]{down, up};
+    }
+
+    // =======================================================================
+    // Diagnostics report (invoked ONLY on user tap — never on the HUD refresh path)
+    // =======================================================================
+
+    /**
+     * One-tap plain-text device report for the "Export HUD diagnostics" action: for every metric it
+     * lists the resolved source path/API + current value, or MISS + the exact candidates it tried,
+     * followed by an "exists on this device" dump (thermal zone types, devfreq/kgsl/mali nodes) so a
+     * device owner can send back the real path for anything that missed. Does a short prime+sample so
+     * delta-based readers (CPU%/GPU%/net) report a live value. Run OFF the main thread.
+     */
+    public String buildDiagnosticsReport(Context ctxIn) {
+        final Context ctx = ctxIn != null ? ctxIn : this.context;
+        // Prime the delta-based readers, wait, then take a live sample.
+        snapshot();
+        try { Thread.sleep(350L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        Snapshot s = snapshot();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Bannerlator HUD diagnostics\n");
+        sb.append("Generated: ")
+          .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())).append('\n');
+        sb.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
+        sb.append("Board/HW: ").append(Build.BOARD).append(" / ").append(Build.HARDWARE).append('\n');
+        sb.append("SoC: ").append(socString()).append('\n');
+        sb.append("Android: ").append(Build.VERSION.RELEASE)
+          .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+        sb.append("CPU cores: ").append(Runtime.getRuntime().availableProcessors()).append('\n');
+        sb.append("GPU renderer: ").append(safeGpu(() -> GPUInformation.getRenderer(null, ctx))).append('\n');
+        sb.append("Vulkan: ").append(safeGpu(() -> GPUInformation.getVulkanVersion(null, ctx))).append('\n');
+
+        sb.append("\n== Metrics ==\n");
+
+        // ---- CPU ----
+        boolean procStat = new File("/proc/stat").canRead();
+        if (s.cpuPercent != null) {
+            metricHit(sb, "CPU %", s.cpuPercent + "%",
+                procStat ? "/proc/stat (cpu aggregate delta)"
+                         : "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq (freq estimate)");
+        } else {
+            metricMiss(sb, "CPU %", "/proc/stat",
+                "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq");
+        }
+
+        // Per-core %
+        StringBuilder cores = new StringBuilder();
+        for (int i = 0; i < s.perCorePercent.length; i++) {
+            if (i > 0) cores.append(' ');
+            int v = s.perCorePercent[i];
+            cores.append('c').append(i).append('=').append(v < 0 ? "?" : (v + "%"));
+        }
+        if (s.perCorePercent.length > 0)
+            metricHit(sb, "Per-core %", cores.toString(), "/proc/stat (per-cpu lines)");
+        else
+            metricMiss(sb, "Per-core %", "/proc/stat");
+
+        // Per-core clock
+        StringBuilder coreClk = new StringBuilder();
+        for (int i = 0; i < s.perCoreClockMhz.length; i++) {
+            if (i > 0) coreClk.append(' ');
+            int v = s.perCoreClockMhz[i];
+            coreClk.append('c').append(i).append('=').append(v <= 0 ? "?" : (v + "MHz"));
+        }
+        if (s.cpuClockMhz != null)
+            metricHit(sb, "CPU clock", s.cpuClockMhz + "MHz (peak); " + coreClk,
+                "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq");
+        else
+            metricMiss(sb, "CPU clock", "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq");
+
+        // CPU temp
+        String cpuTempPath = resolveTempPath(discoverPrioritizedCpuTempPaths());
+        if (s.cpuTempC != null && cpuTempPath != null)
+            metricHit(sb, "CPU temp", s.cpuTempC + "°C", cpuTempPath);
+        else
+            metricMiss(sb, "CPU temp",
+                "/sys/class/thermal/thermal_zone*/temp (types: cpu*/cpuss/tsens/mtktscpu/s5p-tmu/soc)");
+
+        // ---- GPU ----
+        String gpuUsagePath = firstReadableGpuUsagePath();
+        if (s.gpuPercent != null && gpuUsagePath != null)
+            metricHit(sb, "GPU %", s.gpuPercent + "%", gpuUsagePath);
+        else
+            metricMissList(sb, "GPU %", discoverGpuUsagePaths(), GPU_USAGE_STATIC_PATHS);
+
+        String gpuClockPath = firstReadableGpuClockPath();
+        if (s.gpuClockMhz != null && gpuClockPath != null)
+            metricHit(sb, "GPU clock", s.gpuClockMhz + "MHz", gpuClockPath);
+        else
+            metricMissList(sb, "GPU clock", discoverGpuClockPaths(), GPU_CLOCK_PATHS);
+
+        String gpuTempPath = resolveTempPath(discoverPrioritizedGpuTempPaths());
+        if (s.gpuTempC != null)
+            metricHit(sb, "GPU temp", s.gpuTempC + "°C",
+                gpuTempPath != null ? gpuTempPath : "kgsl/mali direct temp node");
+        else
+            metricMiss(sb, "GPU temp",
+                "/sys/class/kgsl/kgsl-3d0/temp", "/sys/class/misc/mali0/device/temp",
+                "/sys/class/thermal/thermal_zone*/temp (types: gpu*/gpuss/g3d/kgsl/mali/mtktsgpu)");
+
+        // ---- Memory ----
+        metricHit(sb, "RAM", s.ramUsedText() + " / " + s.ramTotalText()
+                + " (" + Math.round(s.ramPercent) + "%)", "ActivityManager.MemoryInfo");
+        if (s.swapUsedBytes != null)
+            metricHit(sb, "SWAP", s.swapUsedText() + " / " + s.swapTotalText(), "/proc/meminfo");
+        else
+            metricMiss(sb, "SWAP", "/proc/meminfo (SwapTotal=0 or unreadable)");
+
+        // VRAM
+        String vramPath = firstReadableVramUsedPath();
+        if (s.vramUsedBytes != null && vramPath != null) {
+            Long total = readFirstReadableLong(VRAM_TOTAL_PATHS);
+            String v = s.vramText() + (total != null ? " / " + formatGiB(total) : "");
+            metricHit(sb, "VRAM", v, vramPath);
+        } else {
+            metricMissList(sb, "VRAM (Java sysfs; Vulkan budget = native TODO)",
+                new ArrayList<>(), VRAM_USED_PATHS);
+        }
+
+        // ---- Net ----
+        if (s.netDownBps != null)
+            metricHit(sb, "NET", formatRate(s.netDownBps) + " down / " + formatRate(s.netUpBps) + " up",
+                "/proc/net/dev");
+        else
+            metricMiss(sb, "NET", "/proc/net/dev (first sample or unreadable)");
+
+        // ---- Battery ----
+        Battery b = s.battery;
+        StringBuilder bat = new StringBuilder();
+        bat.append(b.percent != null ? b.percent + "%" : "?%")
+           .append(", ").append(String.format(Locale.US, "%.1fW", b.watts))
+           .append(b.charging ? " (charging)" : "")
+           .append(", temp ").append(b.tempC != null ? b.tempC + "°C" : "?")
+           .append(b.runtimeText != null ? ", " + b.runtimeText : "");
+        metricHit(sb, "Battery", bat.toString(), "BatteryManager + /sys/class/power_supply");
+
+        // ---- Exists-on-device dump ----
+        appendExistsDump(sb);
+        return sb.toString();
+    }
+
+    private static String socString() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL;
+        }
+        return "(SoC id needs Android 12+; HW=" + Build.HARDWARE + ")";
+    }
+
+    private interface GpuStr { String get(); }
+    private static String safeGpu(GpuStr fn) {
+        try { String v = fn.get(); return v == null ? "(null)" : v; }
+        catch (Throwable t) { return "(unavailable: " + t.getClass().getSimpleName() + ")"; }
+    }
+
+    private String firstReadableGpuUsagePath() {
+        for (String p : discoverGpuUsagePaths()) if (readGpuUsageSample(p) != null) return p;
+        return null;
+    }
+
+    private String firstReadableGpuClockPath() {
+        for (String p : discoverGpuClockPaths()) {
+            Long raw = readLongFromLine(p);
+            if (raw != null && raw > 0) return p;
+        }
+        return null;
+    }
+
+    private String firstReadableVramUsedPath() {
+        if (vramUsedPathsCache == null) getVramUsedBytes();   // builds the cache
+        if (vramUsedPathsCache == null) return null;
+        for (String p : vramUsedPathsCache) if (sanitizeVramBytes(readLongFromLine(p)) != null) return p;
+        return null;
+    }
+
+    private static Long readFirstReadableLong(String[] paths) {
+        for (String p : paths) {
+            Long v = readLongFromLine(p);
+            if (v != null && v > 0) return v;
+        }
+        return null;
+    }
+
+    private static String formatRate(Long bps) {
+        if (bps == null) return "?";
+        double kb = bps / 1024.0;
+        if (kb >= 1024.0) return String.format(Locale.US, "%.1fMB/s", kb / 1024.0);
+        return String.format(Locale.US, "%.0fKB/s", kb);
+    }
+
+    private static void metricHit(StringBuilder sb, String name, String value, String source) {
+        sb.append(name).append(": ").append(value).append("\n    source: ").append(source).append('\n');
+    }
+
+    private static void metricMiss(StringBuilder sb, String name, String... candidates) {
+        sb.append(name).append(": MISS\n    tried: ");
+        for (int i = 0; i < candidates.length; i++) {
+            if (i > 0) sb.append("\n           ");
+            sb.append(candidates[i]);
+        }
+        sb.append('\n');
+    }
+
+    private static void metricMissList(StringBuilder sb, String name, List<String> discovered, String[] statics) {
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        if (discovered != null) all.addAll(discovered);
+        for (String p : statics) all.add(p);
+        sb.append(name).append(": MISS\n    tried: ");
+        boolean first = true;
+        for (String p : all) {
+            if (!first) sb.append("\n           ");
+            sb.append(p);
+            first = false;
+        }
+        if (first) sb.append("(no candidates)");
+        sb.append('\n');
+    }
+
+    private void appendExistsDump(StringBuilder sb) {
+        sb.append("\n== Exists on this device (send these back for any MISS above) ==\n");
+        sb.append("-- /sys/class/thermal/thermal_zone*/type --\n");
+        List<String[]> zones = discoverAllThermalZones();
+        if (zones.isEmpty()) sb.append("  (none readable)\n");
+        for (String[] z : zones) sb.append("  ").append(z[1]).append("  type=").append(z[0]).append('\n');
+        appendDevfreqListing(sb, "/sys/class/devfreq");
+        appendDevfreqListing(sb, "/sys/devices/virtual/devfreq");
+        appendReadableFiles(sb, "/sys/class/kgsl/kgsl-3d0");
+        appendReadableFiles(sb, "/sys/class/misc/mali0/device");
+        appendReadableFiles(sb, "/sys/class/drm/card0/device");
+    }
+
+    private static void appendDevfreqListing(StringBuilder sb, String rootPath) {
+        File root = new File(rootPath);
+        File[] nodes = root.listFiles(File::isDirectory);
+        sb.append("-- ").append(rootPath).append(" --\n");
+        if (nodes == null || nodes.length == 0) { sb.append("  (absent / empty)\n"); return; }
+        for (File node : nodes) {
+            sb.append("  ").append(node.getName()).append("/: ").append(readableFileNames(node)).append('\n');
+        }
+    }
+
+    private static void appendReadableFiles(StringBuilder sb, String dirPath) {
+        File dir = new File(dirPath);
+        sb.append("-- ").append(dirPath).append(" --\n");
+        if (!dir.isDirectory()) { sb.append("  (absent / unreadable)\n"); return; }
+        sb.append("  ").append(readableFileNames(dir)).append('\n');
+    }
+
+    private static String readableFileNames(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) return "(unreadable)";
+        StringBuilder names = new StringBuilder();
+        for (File f : files) {
+            if (f.isFile() && f.canRead()) {
+                if (names.length() > 0) names.append(", ");
+                names.append(f.getName());
+            }
+        }
+        return names.length() == 0 ? "(no readable files)" : names.toString();
     }
 
     // =======================================================================

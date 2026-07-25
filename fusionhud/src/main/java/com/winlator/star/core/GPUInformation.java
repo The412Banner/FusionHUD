@@ -17,22 +17,44 @@ import android.opengl.GLES20;
  *   <li>returns an <b>injected</b> string when the integrator has called {@link #setRenderer} (the
  *       recommended path — feed it the real guest renderer / GPU model your emulator already knows);</li>
  *   <li>otherwise performs a one-off throwaway-EGL {@code GLES20.glGetString(GL_RENDERER)} probe and
- *       caches the result, so the classic {@code FrameRating} overlay still shows a real device GPU
+ *       caches the result, so the Fusion HUD's GPU label + diagnostics still show a real device GPU
  *       name standalone.</li>
  * </ol>
  *
- * <p>{@link #extractModelName} is copied verbatim from upstream (self-contained regex, no native
- * dependency) and {@link #isAdrenoGPU} is a substring check, matching upstream semantics. Only
- * {@code getRenderer} differs from the app build — everything the shipped HUD calls is satisfied.
+ * <p>{@link #getVulkanVersion} is likewise native upstream; standalone it returns an injected value
+ * (see {@link #setVulkanVersion}) or {@code "Unknown"}. {@link #extractModelName} is copied verbatim
+ * from upstream (self-contained regex, no native dependency) and {@link #isAdrenoGPU} is a substring
+ * check, matching upstream semantics. Only the native probes differ from the app build — everything the
+ * shipped HUD calls ({@code getRenderer}, {@code getVulkanVersion}) is satisfied.
  */
 public abstract class GPUInformation {
 
     private static volatile String injectedRenderer = null;
     private static volatile String probedRenderer = null;
+    private static volatile String injectedVulkanVersion = null;
 
     /** Inject the renderer string the HUD should display (e.g. your guest's reported GPU). */
     public static void setRenderer(String renderer) {
         injectedRenderer = renderer;
+    }
+
+    /**
+     * Inject the Vulkan version string surfaced in the diagnostics report. In Bannerlator this is a
+     * native probe (spins an ephemeral {@code VkInstance}); standalone we have no native blob, so the
+     * integrator supplies it (or it reads {@code "Unknown"}).
+     */
+    public static void setVulkanVersion(String version) {
+        injectedVulkanVersion = version;
+    }
+
+    /**
+     * Vulkan version for the diagnostics report. Injected value if set, else {@code "Unknown"}. The
+     * args mirror the upstream native signature so callers ({@code HudMetrics.buildDiagnosticsReport})
+     * compile unchanged.
+     */
+    public static String getVulkanVersion(String driverName, Context context) {
+        String v = injectedVulkanVersion;
+        return v != null && !v.isEmpty() ? v : "Unknown";
     }
 
     /**
