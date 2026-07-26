@@ -43,6 +43,10 @@ import java.util.concurrent.Executors;
 public class FpsCounter {
     private static final int COMPUTE_WINDOW_MS = 500;
     private static final int READING_INTERVAL_MS = 1000;
+    // No present for this long => the bound window stopped rendering (paused, a static menu, or a
+    // present path that isn't ticking this window). Report 0 instead of leaving the last value frozen
+    // on the HUD. 1.5 s clears well below 1 fps yet never flickers at normal frame rates.
+    private static final long STALE_FPS_MS = 1500;
 
     private long lastTime = 0;
     private int frameCount = 0;
@@ -59,7 +63,7 @@ public class FpsCounter {
     private final float[] frametimeRing = new float[FRAMETIME_RING_CAP];
     private int frametimeHead = 0;   // next write index
     private int frametimeSize = 0;   // valid samples (<= CAP)
-    private long lastFrameTime = 0;  // elapsedRealtime of the previous tick (for interval)
+    private volatile long lastFrameTime = 0;  // elapsedRealtime of the previous tick (interval + staleness)
     private FrametimeLows cachedLows = FrametimeLows.EMPTY;
     private long cachedLowsTime = 0;
 
@@ -109,8 +113,14 @@ public class FpsCounter {
         frameCount++;
     }
 
-    /** Most recent measured FPS. Lock-free (volatile). */
-    public float getCurrentFPS() { return lastFPS; }
+    /** Most recent measured FPS, or 0 when no frame has been presented within {@link #STALE_FPS_MS} —
+     *  the bound window stopped rendering, so the last value is stale and must not sit frozen on the
+     *  HUD (idle menu, paused game, or a present path not ticking this window). Lock-free. */
+    public float getCurrentFPS() {
+        long last = lastFrameTime;
+        if (last != 0L && SystemClock.elapsedRealtime() - last > STALE_FPS_MS) return 0f;
+        return lastFPS;
+    }
 
     public synchronized float getAvgFPS() {
         return readingCount == 0 ? 0f : (float) fpsSum / readingCount;

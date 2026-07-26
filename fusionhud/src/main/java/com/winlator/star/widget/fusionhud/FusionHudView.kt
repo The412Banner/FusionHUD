@@ -386,16 +386,12 @@ class FusionHudView(
     private fun apiLabel(): String =
         if (showEngine && engineLabel.isNotBlank()) engineLabel else "FPS"
 
-    /** [apiLabel] with the matching DX-wrapper version appended (e.g. "DXVK 2.4.1"), when [appendVer]. */
-    private fun engineLabelWithDx(appendVer: Boolean): String {
-        val base = apiLabel()
-        if (!appendVer) return base
-        val ver = when {
-            engineLabel.contains("VKD3D", true) -> vkd3dVersion
-            engineLabel.contains("DXVK", true) -> dxvkVersion
-            else -> ""
-        }
-        return if (ver.isNotBlank()) "$base $ver" else base
+    /** The DX-wrapper version WITH its engine name (e.g. "DXVK 2.4.1", "VKD3D 2.14"), or "" if none.
+     *  Used for the Mega stack line below the graph. */
+    private fun dxVersionLabeled(): String = when {
+        engineLabel.contains("VKD3D", true) && vkd3dVersion.isNotBlank() -> "VKD3D $vkd3dVersion"
+        engineLabel.contains("DXVK", true) && dxvkVersion.isNotBlank() -> "DXVK $dxvkVersion"
+        else -> ""
     }
 
     /** The DX-wrapper version for the current engine, or "" (used for the Tiles "API" tile sub-line). */
@@ -817,8 +813,9 @@ class FusionHudView(
             val v = ArrayList<Span>()
             v += numUnit(fpsText(fpsNow), "FPS", rowPx, unitPx)
             v += gap(unitPx); v += numUnit(fmt1(1000f / max(fpsNow, 1f)), "ms", rowPx, unitPx)
-            // FPS/engine row: short API label + DX version (gated by "DX ver" / showDxVer).
-            right.add(HudRow(Span(engineLabelWithDx(showDxVer), colFps, rowPx), v))
+            // FPS/engine row: just the short API label. The DX version moved to the stack lines
+            // below the frametime graph (see below), so this row stays compact.
+            right.add(HudRow(Span(apiLabel(), colFps, rowPx), v))
             right.add(HudRow(Span("AVG", colLo, rowPx), numUnit(fmt1(fpsAvg), "FPS", rowPx, unitPx)))
             right.add(HudRow(Span("1%", colLo, rowPx), numUnit(lowText(lows.low1Fps), "FPS", rowPx, unitPx)))
             right.add(HudRow(Span("0.1%", colLo, rowPx), numUnit(lowText(lows.low01Fps), "FPS", rowPx, unitPx)))
@@ -855,12 +852,19 @@ class FusionHudView(
             y += gh
         }
 
-        // ---- Graphics wrapper — the ONLY place it appears. A subtle line BELOW the frametime graph,
-        // same size/style as the bottom band, as a visual continuation (e.g. "GameNative 20260719"). ----
-        if (showWrapper && graphicsWrapper.isNotBlank()) {
+        // ---- Stack-layer lines BELOW the frametime graph, subtle (same size/style as the bottom
+        // band): the DX-wrapper version first (e.g. "DXVK 2.4.1-…", gated by "DX ver"), then the
+        // graphics wrapper beneath it (e.g. "Original", gated by "Wrapper"). ----
+        val dxLine = dxVersionLabeled()
+        val hasDx = showDxVer && dxLine.isNotBlank()
+        if (hasDx) {
             y += sp(4f)
-            val end = placeRun(pad, y - ascent(bandPx), listOf(Span(graphicsWrapper, colDim, bandPx)))
-            maxRight = max(maxRight, end)
+            maxRight = max(maxRight, placeRun(pad, y - ascent(bandPx), listOf(Span(dxLine, colDim, bandPx))))
+            y += lineH(bandPx)
+        }
+        if (showWrapper && graphicsWrapper.isNotBlank()) {
+            y += if (hasDx) sp(1f) else sp(4f)
+            maxRight = max(maxRight, placeRun(pad, y - ascent(bandPx), listOf(Span(graphicsWrapper, colDim, bandPx))))
             y += lineH(bandPx)
         }
 

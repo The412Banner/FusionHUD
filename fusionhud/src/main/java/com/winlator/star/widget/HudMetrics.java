@@ -641,6 +641,30 @@ public class HudMetrics {
         "/sys/class/power_supply/main/current_now",
     };
 
+    /** power_supply voltage_now channels (µV) — fallback when {@code EXTRA_VOLTAGE} reads 0 on some
+     *  OEM firmwares (e.g. HONOR Magic), which otherwise leaves wattage stuck at 0.0W. */
+    private static final String[] VOLTAGE_CHANNELS = {
+        "/sys/class/power_supply/battery/voltage_now",
+        "/sys/class/power_supply/bms/voltage_now",
+        "/sys/class/power_supply/main/voltage_now",
+    };
+    /** power_supply power_now channels (µW) — last-resort direct power reading when neither the
+     *  BatteryManager voltage nor {@code voltage_now} is available. */
+    private static final String[] POWER_CHANNELS = {
+        "/sys/class/power_supply/battery/power_now",
+        "/sys/class/power_supply/bms/power_now",
+        "/sys/class/power_supply/main/power_now",
+    };
+
+    /** First readable long across a channel list, or null. */
+    private static Long readLongFromChannels(String[] paths) {
+        for (String p : paths) {
+            Long v = readLongFromLine(p);
+            if (v != null) return v;
+        }
+        return null;
+    }
+
     private Double smoothedBatteryRuntimeHours = null;
     private static final double MAX_RUNTIME_HOURS = 72.0;
     private static final double RUNTIME_SMOOTHING_OLD_WEIGHT = 0.65;
@@ -675,6 +699,12 @@ public class HudMetrics {
         // sign therefore reads 0W on battery on those devices (and only shows a value while charging).
         // Use the magnitude for the power figure; the reliable charge DIRECTION is EXTRA_PLUGGED (the
         // `charging` flag), which the HUD already uses for the PWR/CHG label.
+        // EXTRA_VOLTAGE reads 0 on some OEM firmwares even though current is fine — fall back to the
+        // power_supply voltage_now (µV → mV) so wattage isn't stuck at 0.
+        if (voltageMv <= 0) {
+            Long uv = readLongFromChannels(VOLTAGE_CHANNELS);
+            if (uv != null && uv > 0) voltageMv = (int) (Math.abs(uv) / 1000L);
+        }
         float watts = (Math.abs(microAmps) * (float) voltageMv) / 1_000_000_000.0f;
         return new Battery(watts, charging);
     }
@@ -704,9 +734,19 @@ public class HudMetrics {
         int rawTemp = status.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
         if (rawTemp > 0) tempC = Math.round(rawTemp / 10f);
 
+        // EXTRA_VOLTAGE reads 0 on some OEM firmwares (e.g. HONOR Magic) even though capacity, temp
+        // and current all work — which left wattage stuck at 0.0W. Fall back to the power_supply
+        // voltage_now (µV → mV); if voltage is still unavailable, use power_now (µW) directly.
+        if (voltageMv <= 0) {
+            Long uv = readLongFromChannels(VOLTAGE_CHANNELS);
+            if (uv != null && uv > 0) voltageMv = (int) (Math.abs(uv) / 1000L);
+        }
         float watts = 0f;
         if (currentMicroAmps > 0L && voltageMv > 0) {
             watts = (float) ((currentMicroAmps * (double) voltageMv) / 1_000_000_000.0);
+        } else {
+            Long uw = readLongFromChannels(POWER_CHANNELS);   // µW
+            if (uw != null && uw != 0L) watts = (float) (Math.abs(uw) / 1_000_000.0);
         }
 
         String runtimeText;
@@ -1034,6 +1074,17 @@ public class HudMetrics {
                 }
             }
         } catch (Exception ignored) {}
+        // Frequency fallback for any core /proc/stat couldn't give us — restricted on some firmwares
+        // (e.g. HONOR / Android 16), which is also why the aggregate getCpuUsagePercent() falls back.
+        // scaling_cur_freq / cpuinfo_max_freq is a load proxy (per-core clocks ARE readable there), and
+        // it also seeds the very first sample. Cores with a real /proc/stat delta keep it (no regression).
+        for (int i = 0; i < out.length; i++) {
+            if (out[i] >= 0) continue;
+            Long cur = readLongFromLine("/sys/devices/system/cpu/cpu" + i + "/cpufreq/scaling_cur_freq");
+            Long max = readLongFromLine("/sys/devices/system/cpu/cpu" + i + "/cpufreq/cpuinfo_max_freq");
+            if (cur != null && max != null && max > 0L)
+                out[i] = clampPercent((int) ((Math.max(0L, Math.min(cur, max)) * 100L) / max));
+        }
         return out;
     }
 
@@ -1320,6 +1371,81 @@ public class HudMetrics {
         appendReadableFiles(sb, "/sys/class/kgsl/kgsl-3d0");
         appendReadableFiles(sb, "/sys/class/misc/mali0/device");
         appendReadableFiles(sb, "/sys/class/drm/card0/device");
+        appendPowerSupplyDump(sb);
+        appendGpuNoRootProbes(sb);
+    }
+
+    /** Probes for a ROOT-FREE GPU-load path on locked-sysfs Adreno devices (SM8750/HONOR etc.):
+     *  (1) can the app open the KGSL device node? The sysfs mirror (/sys/class/kgsl) is SELinux-blocked
+     *      (vendor_sysfs_kgsl), but /dev/kgsl-3d0 is labeled gpu_device and is normally app-openable —
+     *      that's the door for reading GPU busy via ioctl perf-counters instead of sysfs.
+     *  (2) is there an app-readable devfreq node under /sys/devices/platform that bypasses the blocked
+     *      /sys/class/kgsl symlink (a free win for at least the clock). */
+    private void appendGpuNoRootProbes(StringBuilder sb) {
+        sb.append("-- GPU no-root reachability probes --\n");
+        sb.append("  /dev/kgsl-3d0 open O_RDWR:   ")
+          .append(probeOpen("/dev/kgsl-3d0", android.system.OsConstants.O_RDWR)).append('\n');
+        sb.append("  /dev/kgsl-3d0 open O_RDONLY: ")
+          .append(probeOpen("/dev/kgsl-3d0", android.system.OsConstants.O_RDONLY)).append('\n');
+        sb.append("  /dev/dri/renderD128 O_RDWR:  ")
+          .append(probeOpen("/dev/dri/renderD128", android.system.OsConstants.O_RDWR)).append('\n');
+        boolean found = false;
+        File[] roots = { new File("/sys/devices/platform/soc"), new File("/sys/devices/platform") };
+        for (File root : roots) {
+            File[] nodes = root.listFiles();
+            if (nodes == null) continue;
+            for (File soc : nodes) {
+                if (!soc.getName().contains("kgsl-3d0")) continue;
+                File[] inner = new File(soc, "devfreq").listFiles();
+                if (inner == null) continue;
+                for (File node : inner) {
+                    found = true;
+                    Long cur = readLongFromLine(node + "/cur_freq");
+                    Long load = readLongFromLine(node + "/gpu_load");
+                    if (load == null) load = readLongFromLine(node + "/load");
+                    sb.append("  devfreq ").append(node.getAbsolutePath())
+                      .append(": cur_freq=").append(cur == null ? "—" : cur.toString())
+                      .append(" load=").append(load == null ? "—" : load.toString()).append('\n');
+                }
+            }
+        }
+        if (!found) sb.append("  devfreq (platform kgsl): (no app-readable node found)\n");
+    }
+
+    /** open()+close() a path with the given flags, reporting OK or the errno class — used to test
+     *  whether the app's sandbox can reach a device node without root. */
+    private static String probeOpen(String path, int flags) {
+        java.io.FileDescriptor fd = null;
+        try {
+            fd = android.system.Os.open(path, flags, 0);
+            return "OK";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName() + ": " + t.getMessage();
+        } finally {
+            if (fd != null) try { android.system.Os.close(fd); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** Battery-wattage inputs: which power_supply nodes this app can actually READ, and their raw
+     *  values. Confirms the voltage_now / power_now fallback for devices where EXTRA_VOLTAGE is 0. */
+    private void appendPowerSupplyDump(StringBuilder sb) {
+        sb.append("-- /sys/class/power_supply (battery watts inputs) --\n");
+        File[] nodes = new File("/sys/class/power_supply").listFiles();
+        if (nodes == null || nodes.length == 0) { sb.append("  (absent / unreadable)\n"); return; }
+        boolean any = false;
+        for (File node : nodes) {
+            Long v = readLongFromLine(node + "/voltage_now");
+            Long c = readLongFromLine(node + "/current_now");
+            Long p = readLongFromLine(node + "/power_now");
+            if (v == null && c == null && p == null) continue;
+            any = true;
+            sb.append("  ").append(node.getName())
+              .append(": voltage_now=").append(v == null ? "—" : v + "µV")
+              .append(" current_now=").append(c == null ? "—" : c + "µA")
+              .append(" power_now=").append(p == null ? "—" : p + "µW")
+              .append('\n');
+        }
+        if (!any) sb.append("  (nodes present but voltage_now/current_now/power_now unreadable)\n");
     }
 
     private static void appendDevfreqListing(StringBuilder sb, String rootPath) {
