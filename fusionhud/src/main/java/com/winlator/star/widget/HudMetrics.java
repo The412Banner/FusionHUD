@@ -705,7 +705,8 @@ public class HudMetrics {
             Long uv = readLongFromChannels(VOLTAGE_CHANNELS);
             if (uv != null && uv > 0) voltageMv = (int) (Math.abs(uv) / 1000L);
         }
-        float watts = (Math.abs(microAmps) * (float) voltageMv) / 1_000_000_000.0f;
+        // current unit auto-detected (mA vs µA) — see currentRawToAmps.
+        float watts = (voltageMv / 1000f) * currentRawToAmps(microAmps);
         return new Battery(watts, charging);
     }
 
@@ -741,9 +742,14 @@ public class HudMetrics {
             Long uv = readLongFromChannels(VOLTAGE_CHANNELS);
             if (uv != null && uv > 0) voltageMv = (int) (Math.abs(uv) / 1000L);
         }
+        // Wattage = current × voltage, with current UNIT auto-detected (CURRENT_NOW is nominally µA but
+        // many OEMs — e.g. this HONOR — report mA; see batteryCurrentAmps). currentMicroAmps above stays
+        // as-is for the runtime estimate (a ratio, so unit-independent). If neither current nor voltage
+        // resolves, fall back to power_now (µW) directly.
+        float amps = batteryCurrentAmps(bm);
         float watts = 0f;
-        if (currentMicroAmps > 0L && voltageMv > 0) {
-            watts = (float) ((currentMicroAmps * (double) voltageMv) / 1_000_000_000.0);
+        if (amps > 0f && voltageMv > 0) {
+            watts = (voltageMv / 1000f) * amps;
         } else {
             Long uw = readLongFromChannels(POWER_CHANNELS);   // µW
             if (uw != null && uw != 0L) watts = (float) (Math.abs(uw) / 1_000_000.0);
@@ -782,6 +788,28 @@ public class HudMetrics {
     private long readCurrentNowFallback() {
         BatteryManager bm = (BatteryManager) context.getSystemService(Context.BATTERY_SERVICE);
         return bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
+    }
+
+    /** Raw battery current reading → AMPS, with unit AUTO-DETECT. {@code BATTERY_PROPERTY_CURRENT_NOW}
+     *  (and {@code current_now}) are nominally µA, but many OEMs report mA — a small number, whereas a
+     *  real µA reading is always huge. So a magnitude &lt; 20000 means the device gave mA. Without this,
+     *  wattage on mA-reporting devices came out ~1000× too small → 0.0W even though current & voltage are
+     *  fine. Sentinel/zero → 0. (Heuristic mirrors Ludashi-plus WinlatorHUD.getBatteryCurrentAmps().) */
+    private static float currentRawToAmps(long raw) {
+        if (raw == 0L || raw == Long.MIN_VALUE) return 0f;
+        long a = Math.abs(raw);
+        return a < 20000L ? a / 1000f : a / 1_000_000f;   // mA → A, else µA → A
+    }
+
+    /** Battery current in AMPS for the wattage calc: framework property first, then power_supply
+     *  {@code current_now} sysfs (battery/bms/main) when it's unsupported ({@code Long.MIN_VALUE}) or 0. */
+    private float batteryCurrentAmps(BatteryManager bm) {
+        long raw = (bm != null) ? bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) : 0L;
+        if (raw == 0L || raw == Long.MIN_VALUE) {
+            Long sys = readLongFromChannels(CURRENT_CHANNELS);
+            raw = (sys != null) ? sys : 0L;
+        }
+        return currentRawToAmps(raw);
     }
 
     // =======================================================================
