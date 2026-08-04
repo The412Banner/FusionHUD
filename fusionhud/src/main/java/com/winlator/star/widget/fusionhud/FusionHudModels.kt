@@ -41,7 +41,7 @@ enum class FusionSize(val token: String, val label: String) {
         // "Wrapper" and "DX ver" are Mega-only: the wrapper appears solely below Mega's frametime graph,
         // and "DX ver" gates the DX-version suffix on Mega's FPS-row engine label.
         val MINIMAL_CHIPS = setOf("FPS", "FPS graph", "0.01% low", "FPS .1", "Engine", "Clock")
-        val PILL_CHIPS = setOf("FPS", "FPS graph", "GPU", "CPU", "VRAM", "Battery", "GPU model", "FPS .1", "Engine", "Clock")
+        val PILL_CHIPS = setOf("FPS", "FPS graph", "GPU", "CPU", "VRAM", "RAM", "Battery", "GPU model", "FPS .1", "Engine", "Clock")
         val STANDARD_CHIPS = setOf(
             "FPS", "FPS graph", "GPU", "GPU temp", "CPU", "VRAM", "RAM", "Power", "Temp",
             "Battery", "GPU model", "Engine", "0.01% low", "FPS .1", "Clock",

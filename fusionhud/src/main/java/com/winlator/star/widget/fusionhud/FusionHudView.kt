@@ -207,7 +207,7 @@ class FusionHudView(
         if (configString.isNullOrEmpty()) return
         val cfg = KeyValueSet(configString)
 
-        size = FusionSize.from(cfg.get("hudSize", "full"))
+        size = FusionSize.from(cfg.get("hudSize", "pill"))
         showFPS = cfg.get("showFPS", "1") == "1"
         showEngine = cfg.get("showEngine", "1") == "1"
         showGpuModel = cfg.get("showGpuModel", "1") == "1"
@@ -606,17 +606,23 @@ class FusionHudView(
             if (showCPU) { if (l.isNotEmpty()) l += Span(" · ", colDim, stkPx); l += Span("CPU ${s.cpuPercent ?: "—"}%", colCpu, stkPx) }
             if (l.isNotEmpty()) stack.add(l)
         }
-        run {
-            val l = ArrayList<Span>()
-            l += Span("${fmt1(1000f / max(fpsNow, 1f))}ms", colDim, stkPx)
-            if (showVram && s.vramText() != null) { l += Span(" · ", colDim, stkPx); l += Span("${s.vramText()} vram", colDim, stkPx) }
-            stack.add(l)
+        // RAM % (system-wide) takes the slot the latency row used to occupy, matching the GPU/CPU idiom
+        // on the row above it. colRam keeps RAM's identity colour consistent with the Full/Tiles sizes.
+        if (showRAM) {
+            stack.add(listOf(Span("RAM ${s.ramPercent.roundToInt()}%", colRam, stkPx)))
         }
         if (showBattery || showPower) {
             val l = ArrayList<Span>(); var any = false
             if (showBattery && s.battery.percent != null) { l += Span("BAT ${s.battery.percent}%", colBat, stkPx); any = true }
             if (showPower && s.battery.watts > 0f) { if (any) l += Span(" · ", colDim, stkPx); l += Span("${fmt1(s.battery.watts)}W", colDim, stkPx) }
             if (any) stack.add(l)
+        }
+        // Latency (+ optional VRAM) drops to the bottom of the stack, under the battery row.
+        run {
+            val l = ArrayList<Span>()
+            l += Span("${fmt1(1000f / max(fpsNow, 1f))}ms", colDim, stkPx)
+            if (showVram && s.vramText() != null) { l += Span(" · ", colDim, stkPx); l += Span("${s.vramText()} vram", colDim, stkPx) }
+            stack.add(l)
         }
 
         // Left column: a small API/engine caption (DXVK/VKD3D/Zink) centred ABOVE the big FPS — mirroring
