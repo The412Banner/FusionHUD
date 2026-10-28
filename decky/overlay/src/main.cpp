@@ -643,9 +643,34 @@ private:
             sy += stkH + stkLineGap;
         }
         addSubtleClock(pad, pad + leftBlockW / 2.0f);
-        // Keep the text clear of the capsule's rounded ends.
-        const float minW = contentH + std::max(leftBlockW, stackW);
-        if (contentW < minW) contentW = minW;
+        fitCapsule();
+    }
+
+    // The capsule's ends curve in (radius = height / 2), so a line near the top or bottom can fit the box
+    // and still cross the outline. Shift everything right and widen until every line clears both ends by
+    // FusionHUD's capsule margin (outline width + 2sp).
+    void fitCapsule() {
+        const float r = contentH / 2.0f;
+        const float margin = (outline > 0 ? outline * sp(3.5f) : 0.0f) + sp(2.0f);
+        auto curveIn = [&](float top, float bottom) {
+            const float d = std::min(top, contentH - bottom);  // closest the line gets to the top or bottom
+            if (d >= r) return 0.0f;
+            const float dy = r - std::max(d, 0.0f);
+            return r - std::sqrt(std::max(0.0f, r * r - dy * dy));
+        };
+        float shift = 0;
+        for (const auto &g : glyphs) {
+            const float top = g.baseline - ascent(g.px), bottom = top + lineH(g.px);
+            shift = std::max(shift, curveIn(top, bottom) + margin - g.x);
+        }
+        if (shift > 0) {
+            for (auto &g : glyphs) g.x += shift;
+            contentW += shift;
+        }
+        for (const auto &g : glyphs) {
+            const float top = g.baseline - ascent(g.px), bottom = top + lineH(g.px);
+            contentW = std::max(contentW, g.x + measure(g.text, g.px) + curveIn(top, bottom) + margin);
+        }
     }
 
     void build_minimal(const FpsNow &f) {
