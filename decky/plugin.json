@@ -1,0 +1,11 @@
+{
+  "name": "FusionHUD",
+  "author": "The412Banner",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["overlay", "mangohud", "droiddeck"],
+    "description": "Gives Steam's performance overlay the FusionHUD look: levels 1-4 become Minimal, Pill, Full and Mega.",
+    "image": "https://opengraph.githubassets.com/1/The412Banner/FusionHUD"
+  }
+}
