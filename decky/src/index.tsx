@@ -31,15 +31,24 @@ const setOverlay = callable<[on: boolean], State>("set_overlay");
 const setHud = callable<[key: string, value: string], State>("set_hud");
 const resetHud = callable<[], State>("reset_hud");
 
-// FusionSize.supportedChips() (FusionHudModels.kt). The overlay draws Pill and Minimal so far.
-const SIZES = [
+// FusionSize.supportedChips() (FusionHudModels.kt), minus the switches a size never draws: FPS on Pill and
+// Minimal (always shown there), graph and 0.01 % low on Tiles. Engine, Wrapper and DX version stay hidden:
+// DroidDeck's gamescope reports no engine and there is no wrapper, so nothing could fill them.
+const SIZES = [  // FusionSize order, as Bannerlator's size picker
+  { data: "full", label: "Full" },
+  { data: "tiles", label: "Tiles" },
   { data: "pill", label: "Pill" },
-  { data: "minimal", label: "Minimal" }
+  { data: "minimal", label: "Minimal" },
+  { data: "mega", label: "Mega" }
 ];
+const STANDARD = ["FPS", "FPS graph", "GPU model", "GPU", "GPU temp", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "0.01% low", "FPS .1", "Clock"];
 const SIZE_CHIPS: Record<string, string[]> = {
-  minimal: ["FPS", "FPS graph", "0.01% low", "FPS .1", "Engine", "Clock"],
+  minimal: ["FPS graph", "0.01% low", "FPS .1", "Clock"],
   // The Pill also draws battery temperature and watts, so their switches are listed here too.
-  pill: ["FPS", "GPU", "CPU", "VRAM", "RAM", "Temp", "Battery", "Power", "GPU model", "FPS .1", "Engine", "Clock"]
+  pill: ["GPU model", "GPU", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "FPS .1", "Clock"],
+  full: STANDARD,
+  tiles: STANDARD.filter((c) => c !== "FPS graph" && c !== "0.01% low"),
+  mega: [...STANDARD, "Per-core", "Swap", "Network", "Resolution", "Proton", "Session"]
 };
 
 // Bannerlator's metric switches (DeckOverlaySettings.kt): label, config key, chip.
@@ -133,7 +142,7 @@ function Content() {
 
   const size = SIZE_CHIPS[hud.hudSize] ? hud.hudSize : "pill";
   const chips = SIZE_CHIPS[size];
-  const tempsShown = chips.includes("Temp") && (on("showTemp") || on("showGpuTemp"));
+  const tempsShown = (chips.includes("Temp") && on("showTemp")) || (chips.includes("GPU temp") && on("showGpuTemp"));
   const bands = hud.tempBands === "0" ? "0" : hud.tempAuto === "0" ? "2" : "1";
 
   return (

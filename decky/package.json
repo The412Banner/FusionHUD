@@ -1,6 +1,6 @@
 {
   "name": "fusionhud-decky",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "FusionHUD look for Steam's performance overlay (MangoHud presets), for DroidDeck's Decky Loader",
   "type": "module",
   "scripts": {

@@ -2,7 +2,7 @@
 
 A Decky Loader plugin that brings [FusionHUD](https://github.com/The412Banner/FusionHUD) to DroidDeck's Steam session.
 
-- **FusionHUD overlay:** the real FusionHUD drawn over games by its own small program (`bin/fusionhud-overlay`), switched on and set up from the plugin's panel: size, position, size on screen, opacity, colour, outline, accent, the metric switches and temperature colours, with the same settings as Bannerlator's HUD. Steam's own performance overlay stays off: gamescope shows one overlay at a time, and FusionHUD's shows while Steam's Performance Overlay Level is OFF. Sizes so far: Pill and Minimal.
+- **FusionHUD overlay:** the real FusionHUD drawn over games by its own small program (`bin/fusionhud-overlay`), switched on and set up from the plugin's panel: size, position, size on screen, opacity, colour, outline, accent, the metric switches and temperature colours, with the same settings as Bannerlator's HUD (switches a size can't draw, and Engine / Wrapper / DX version, which DroidDeck has no data for, are left out). Steam's own performance overlay stays off: gamescope shows one overlay at a time, and FusionHUD's shows while Steam's Performance Overlay Level is OFF. All five FusionHUD sizes: Full, Tiles, Pill, Minimal and Mega.
 - **Steam overlay styles (optional):** FusionHUD colours for Steam's own performance overlay levels 1-4, through MangoHud presets.
 
 | Steam level | Style with "Steam overlay styles" on |
