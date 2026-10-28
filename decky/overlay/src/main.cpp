@@ -300,7 +300,8 @@ private:
     uint32_t protonPid = 0;
     std::string protonName;
     bool tempsFound = false;
-    std::string cpuTempFile, gpuTempFile, batteryDir;
+    std::string gpuTempFile, cpuSilicon, cpuHwmon, batteryDir;
+    std::vector<std::string> cpuZones;
 
     static std::string gpu_name() {
         // As FusionHUD's GPUInformation.extractModelName: "zink Vulkan 1.4(Turnip Adreno (TM) 750 ...)" → "Adreno 750".
@@ -501,50 +502,77 @@ private:
         return (c >= 1.0f && c <= 150.0f) ? c : NAN;
     }
 
-    // hwmon first (DroidDeck: cpu0_thermal, gpuss0_thermal), then KGSL's own temp, then thermal zones ranked
-    // as FusionHUD's HudMetrics does.
+    // GPU: the GPU's own nodes first, as FusionHUD's HudMetrics.getGpuTempC (in DroidDeck kgsl-3d0/temp is the
+    // app's copy of the real GPU sensor), then GPU-named hwmon/thermal sensors.
+    // CPU: a cpu-silicon zone if there is one, else the median of every CPU thermal zone. DroidDeck's guest renames
+    // its CPU zones to "cpu0-thermal" and mounts the GPU and DDR temperatures over three of them (zones 26, 28, 22
+    // on the Pocket FIT; its hwmon cpu0_thermal links to zone 28), so neither the names nor one picked zone can be
+    // trusted there; the median of all of them still is. hwmon is the fallback when there are no thermal zones.
     void find_temps() {
         tempsFound = true;
-        int cpuRank = 99, gpuRank = 99;
-        auto offer = [&](const std::string &type, const std::string &file) {
-            std::string t = type;
-            for (auto &ch : t) ch = char(tolower(ch));
-            int c = 99, g = 99;
-            if (t == "cpu-silicon") c = 0;
-            else if (t.rfind("cpu-0", 0) == 0 || t.rfind("cpu0", 0) == 0) c = 1;
-            else if (t.find("cpu") != std::string::npos && t.find("gpu") == std::string::npos) c = 2;
-            else if (t.find("soc") != std::string::npos) c = 3;
-            if (t == "gpu-silicon") g = 0;
-            else if (t.find("gpuss") != std::string::npos) g = 1;
-            else if (t.find("gpu") != std::string::npos) g = 2;
-            if (c < cpuRank && !std::isnan(read_milli(file))) { cpuRank = c; cpuTempFile = file; }
-            if (g < gpuRank && !std::isnan(read_milli(file))) { gpuRank = g; gpuTempFile = file; }
+        cpuZones.clear();
+        for (const char *p : {"/sys/class/kgsl/kgsl-3d0/temp", "/sys/class/kgsl/kgsl-3d0/devfreq/temp",
+                              "/sys/class/misc/mali0/device/temp", "/sys/kernel/gpu/temp"}) {
+            if (!std::isnan(read_milli(p))) { gpuTempFile = p; break; }
+        }
+        int gpuRank = gpuTempFile.empty() ? 99 : -1;
+        auto lower = [](std::string t) { for (auto &ch : t) ch = char(tolower(ch)); return t; };
+        auto gpuRankOf = [](const std::string &t) {
+            if (t == "gpu-silicon") return 0;
+            if (t.find("gpuss") != std::string::npos) return 1;
+            if (t.find("gpu") != std::string::npos) return 2;
+            return 99;
         };
-        if (DIR *d = opendir("/sys/class/hwmon")) {
-            while (dirent *e = readdir(d)) {
-                if (e->d_name[0] == '.') continue;
-                const std::string dir = std::string("/sys/class/hwmon/") + e->d_name;
-                offer(read_line(dir + "/name"), dir + "/temp1_input");
-            }
-            closedir(d);
-        }
-        if (gpuRank > 1 && !std::isnan(read_milli("/sys/class/kgsl/kgsl-3d0/temp"))) {
-            gpuRank = 1;
-            gpuTempFile = "/sys/class/kgsl/kgsl-3d0/temp";
-        }
         if (DIR *d = opendir("/sys/class/thermal")) {
             while (dirent *e = readdir(d)) {
                 if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
                 const std::string zone = std::string("/sys/class/thermal/") + e->d_name;
-                offer(read_line(zone + "/type"), zone + "/temp");
+                const std::string t = lower(read_line(zone + "/type")), file = zone + "/temp";
+                if (std::isnan(read_milli(file))) continue;
+                if (t.find("cpu") != std::string::npos && t.find("gpu") == std::string::npos) {
+                    if (t == "cpu-silicon") cpuSilicon = file;
+                    cpuZones.push_back(file);
+                }
+                const int g = gpuRankOf(t);
+                if (g < gpuRank) { gpuRank = g; gpuTempFile = file; }
             }
             closedir(d);
         }
+        if (DIR *d = opendir("/sys/class/hwmon")) {
+            while (dirent *e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                const std::string dir = std::string("/sys/class/hwmon/") + e->d_name;
+                const std::string t = lower(read_line(dir + "/name")), file = dir + "/temp1_input";
+                if (std::isnan(read_milli(file))) continue;
+                if (cpuZones.empty() && cpuHwmon.empty() && t.find("cpu") != std::string::npos && t.find("gpu") == std::string::npos)
+                    cpuHwmon = file;
+                const int g = gpuRankOf(t);
+                if (g < gpuRank) { gpuRank = g; gpuTempFile = file; }
+            }
+            closedir(d);
+        }
+        fprintf(stderr, "fusionhud-overlay: gpu temp %s; cpu temp %s\n", gpuTempFile.empty() ? "none" : gpuTempFile.c_str(),
+                !cpuSilicon.empty() ? cpuSilicon.c_str()
+                : !cpuZones.empty() ? ("median of " + std::to_string(cpuZones.size()) + " cpu thermal zones").c_str()
+                : !cpuHwmon.empty() ? cpuHwmon.c_str() : "none");
+    }
+
+    float cpu_temp() const {
+        if (!cpuSilicon.empty()) return read_milli(cpuSilicon);
+        if (cpuZones.empty()) return read_milli(cpuHwmon);
+        std::vector<float> v;
+        for (const auto &z : cpuZones) {
+            const float c = read_milli(z);
+            if (!std::isnan(c)) v.push_back(c);
+        }
+        if (v.empty()) return NAN;
+        std::sort(v.begin(), v.end());
+        return v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2.0f;
     }
 
     void temps(Snapshot &s) {
         if (!tempsFound) find_temps();
-        s.cpuTemp = read_milli(cpuTempFile);
+        s.cpuTemp = cpu_temp();
         s.gpuTemp = read_milli(gpuTempFile);
     }
 };
