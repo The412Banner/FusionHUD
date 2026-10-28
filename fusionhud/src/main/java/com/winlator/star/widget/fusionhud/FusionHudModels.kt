@@ -52,3 +52,22 @@ enum class FusionSize(val token: String, val label: String) {
         val MEGA_CHIPS = STANDARD_CHIPS + MEGA_ONLY
     }
 }
+
+/**
+ * The Wayland HDR state the Fusion HUD shows on its own line, directly under the latency · display-server
+ * line (the host sets it with [FusionHudView.setHdrState]). [NONE] = no line at all: every session whose
+ * HDR gate is closed (X11, SDR screens, HDR off) keeps the HUD exactly as it was.
+ */
+object FusionHdr {
+    const val NONE = 0
+    const val ON = 1           // HDR frames on screen with HDR headroom
+    const val NO_HEADROOM = 2  // HDR frames on screen, but the display gives them no headroom (5 s+)
+    const val OFF = 3          // the drawer's HDR output switch is off (tone-mapped to SDR)
+    const val READY = 4        // HDR open for the session, no HDR frames on screen right now
+    const val TONEMAPPED = 5   // HDR output on, but the frames are shown tone-mapped (frame generation
+                               // on a screen that offers no HDR10 swapchain)
+    const val NOT_ON_THIS_SCREEN = 6 // HDR open for the session, but the screen the game is on NOW
+                               // reports no HDR10 (the TV was unplugged mid-game). The offer to the
+                               // game cannot be withdrawn once made, so the gate stays open for the
+                               // session — but "ready" would be a lie on a panel that cannot show it.
+}

@@ -227,6 +227,10 @@ public class HudMetrics {
         "/sys/class/pvr/gpu_utilisation",
         "/sys/class/drm/card0/device/gpu_busy_percent", // amdgpu / Xclipse (sgpu), 0..100
         "/sys/class/devfreq/gpu/load",
+        // ── Additive cross-vendor fallbacks (appended LAST: tried only after every path above
+        //    misses, so a device that already resolves — e.g. Adreno kgsl — never reaches these). ──
+        "/sys/kernel/ged/hal/gpu_utilization",       // MediaTek GED: "<loading> <block> <idle>" → loading%
+        "/sys/module/ged/parameters/gpu_loading",    // MediaTek GED module param, plain percent
     };
     // Percent-bearing filenames scanned under each devfreq / platform GPU node.
     private static final String[] GPU_USAGE_FILES = {
@@ -665,6 +669,42 @@ public class HudMetrics {
         return null;
     }
 
+    /**
+     * ADDITIVE charging fallback from {@code /sys/class/power_supply/*}, consulted ONLY when the
+     * framework gave no usable charge state ({@code EXTRA_STATUS == UNKNOWN} or a null battery intent).
+     * A charger/input supply reporting {@code online == 1} — or the battery's own {@code status} reading
+     * "Charging"/"Full" — means charging. Returns TRUE when charging is positively detected, FALSE when a
+     * status/online node is readable but not charging, or null when nothing usable exists (so the caller
+     * keeps its own default). Never reached on devices whose BatteryManager reports a real status
+     * (e.g. Adreno phones/handhelds), so it cannot change their reading.
+     */
+    private static Boolean readChargingFromPowerSupply() {
+        File[] supplies = new File("/sys/class/power_supply").listFiles();
+        if (supplies == null || supplies.length == 0) return null;
+        Boolean sawSignal = null;
+        for (File supply : supplies) {
+            String name = supply.getName().toLowerCase(Locale.US);
+            String type = readFirstLine(new File(supply, "type").getPath());
+            type = type == null ? "" : type.trim().toLowerCase(Locale.US);
+            boolean isBattery = type.equals("battery") || name.equals("battery") || name.equals("bms");
+            if (isBattery) {
+                // The battery's own status string is the most direct charge-state signal.
+                String st = readFirstLine(new File(supply, "status").getPath());
+                if (st == null) continue;
+                st = st.trim().toLowerCase(Locale.US);
+                sawSignal = Boolean.FALSE;                 // "discharging"/"not charging" both land here
+                if (st.equals("charging") || st.equals("full")) return Boolean.TRUE;
+            } else {
+                // A charger / power-input supply (ac/usb/wireless/mains/dc): online==1 → external power in.
+                Long online = readLongFromLine(new File(supply, "online").getPath());
+                if (online == null) continue;
+                sawSignal = Boolean.FALSE;
+                if (online == 1L) return Boolean.TRUE;
+            }
+        }
+        return sawSignal;
+    }
+
     private Double smoothedBatteryRuntimeHours = null;
     private static final double MAX_RUNTIME_HOURS = 72.0;
     private static final double RUNTIME_SMOOTHING_OLD_WEIGHT = 0.65;
@@ -682,6 +722,11 @@ public class HudMetrics {
         if (status != null) {
             charging = status.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
             voltageMv = status.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
+        } else {
+            // ADDITIVE: no battery intent → best-effort power_supply charge probe (default stays false).
+            // Never reached on devices that deliver ACTION_BATTERY_CHANGED (e.g. Adreno).
+            Boolean sysCharging = readChargingFromPowerSupply();
+            if (sysCharging != null) charging = sysCharging;
         }
         long microAmps;
         if (dualBattery) {
@@ -723,10 +768,20 @@ public class HudMetrics {
         if (cap >= 0 && cap <= 100) percent = cap;
 
         Intent status = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        if (status == null) return new Battery(0f, false, percent, null, null);
+        if (status == null) {
+            // No battery intent at all → additive power_supply charge probe (default stays false).
+            Boolean sysCharging = readChargingFromPowerSupply();
+            return new Battery(0f, sysCharging != null && sysCharging, percent, null, null);
+        }
 
         int st = status.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
         boolean charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+        // ADDITIVE: only when the framework reports no usable charge state do we consult power_supply.
+        // A device that reports CHARGING/DISCHARGING/FULL/NOT_CHARGING (e.g. Adreno) never enters this.
+        if (st == BatteryManager.BATTERY_STATUS_UNKNOWN) {
+            Boolean sysCharging = readChargingFromPowerSupply();
+            if (sysCharging != null) charging = sysCharging;
+        }
         long currentMicroAmps = Math.abs(bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW));
         long chargeCounter = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
         int voltageMv = status.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
@@ -837,6 +892,10 @@ public class HudMetrics {
         "/sys/devices/platform/gpusysfs/gpu_clock",    // Exynos Mali vendor node, MHz
         "/sys/class/misc/mali0/device/clock",          // Mali, kHz/MHz
         "/sys/class/devfreq/gpu/cur_freq",             // generic devfreq gpu, Hz
+        // ── Additive cross-vendor fallbacks (appended LAST: only reached when every node above
+        //    is unreadable, so Adreno/Mali devices that already resolve are unaffected). ──
+        "/sys/kernel/ged/hal/current_freqency",        // MediaTek GED (vendor's spelling), kHz
+        "/sys/kernel/ged/hal/gpu_clock",               // MediaTek GED alt, MHz
     };
 
     private List<String> discoverGpuClockPaths() {

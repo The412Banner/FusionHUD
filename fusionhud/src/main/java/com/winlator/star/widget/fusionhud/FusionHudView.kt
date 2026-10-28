@@ -36,6 +36,7 @@ import java.util.Locale
 import java.util.function.BiConsumer
 import java.util.function.Consumer
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +71,14 @@ class FusionHudView(
 
     private var fpsCounter: FpsCounter? = null
     fun setFpsCounter(counter: FpsCounter?) { fpsCounter = counter }
+
+    // Frames per second actually reaching the panel. FpsCounter is ticked once
+    // per GUEST frame, so it counts what the game draws and cannot see frames
+    // added after it: with native LSFG generating three for every one, this HUD
+    // showed 30 while the display was showing 118. 0 = nothing is adding
+    // frames, and the readout is exactly what it always was.
+    private var presentedFps = 0f
+    fun setPresentedFps(fps: Float) { presentedFps = fps }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var updateJob: Job? = null
@@ -113,7 +122,14 @@ class FusionHudView(
     private var showSession = true
 
     private var engineLabel = ""
+    private var displayServer = ""     // "X11" / "Wayland": which display server the game runs on
+    private var hdrState = FusionHdr.NONE  // Wayland HDR, on its own line under latency · display server
     private var gpuModel = ""
+    // The GPU name a Wayland session reports to games instead of the real adapter ("" = none). It has
+    // to travel separately from gpuModel: Wayland hands the spoof to DXVK and leaves the Vulkan device
+    // alone, so everything the host reads back is still the real chip. On X11 the driver wrapper renames
+    // the device itself, so there gpuModel already IS the spoofed name and this stays empty.
+    private var gpuSpoofName = ""
     // Stack-layer version strings (Mega bottom band + DX version on the engine row); fed by the host.
     private var wineVersion = ""       // "Proton 10.0-4"
     private var graphicsWrapper = ""   // graphics-driver wrapper package, e.g. "GameNative", "bcn_layer 20260719"
@@ -138,6 +154,8 @@ class FusionHudView(
     private val colValue = 0xFFF2F5F9.toInt()
     private val colDim = 0xFF9AA4B2.toInt()
     private val colLo = 0xFFE4E8EE.toInt()
+    private val colDisp = 0xFF4DD0E1.toInt()   // display server (X11 / Wayland)
+    private val colHdr = 0xFFFFD54F.toInt()    // HDR on screen
 
     // ---- Paints -----------------------------------------------------------
     private val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -187,6 +205,15 @@ class FusionHudView(
     // ---- Public surface (symmetric with the other overlays) ---------------
     fun setEngineLabel(s: String?) { engineLabel = s ?: ""; post { rebuildAndInvalidate() } }
     fun setGpuModel(s: String?) { gpuModel = s ?: ""; post { rebuildAndInvalidate() } }
+    /** This session's Wayland GPU-name spoof (null / empty = none, the default): the GPU row names it
+     *  in place of the real model, marked so it can't be read as the chip that is really rendering. */
+    fun setGpuSpoofName(s: String?) { gpuSpoofName = s ?: ""; post { rebuildAndInvalidate() } }
+    fun setDisplayServer(s: String?) { displayServer = s ?: ""; post { rebuildAndInvalidate() } }
+    /** [FusionHdr] code; [FusionHdr.NONE] (the default) draws no HDR line anywhere. Any thread. */
+    fun setHdrState(state: Int) {
+        val v = if (state in FusionHdr.ON..FusionHdr.NOT_ON_THIS_SCREEN) state else FusionHdr.NONE
+        post { if (v != hdrState) { hdrState = v; rebuildAndInvalidate() } }
+    }
     fun setWineVersion(s: String?) { wineVersion = s ?: ""; post { rebuildAndInvalidate() } }
     fun setGraphicsWrapper(s: String?) { graphicsWrapper = s ?: ""; post { rebuildAndInvalidate() } }
     fun setDxWrapper(dxvk: String?, vkd3d: String?) {
@@ -323,8 +350,20 @@ class FusionHudView(
         return x
     }
 
-    private fun fpsText(v: Float): String =
+    private fun one(v: Float): String =
         if (fpsDecimal) String.format(Locale.US, "%.1f", v) else v.roundToInt().toString()
+
+    // Shows "30->118" while something downstream of the game is adding frames.
+    // The game's own rate stays visible next to the panel rate, because the gap
+    // between the two is precisely what frame generation is doing.
+    private fun fpsText(v: Float): String =
+        if (differs(v)) "${one(v)}\u2192${one(presentedFps)}" else one(v)
+
+    // Either direction: up = frames added (LSFG Native), down = frames lost
+    // between the guest and the panel, which is the failure win-fg can hit
+    // and which a single number hides completely.
+    private fun differs(v: Float): Boolean =
+        presentedFps > 0f && kotlin.math.abs(presentedFps - v) > maxOf(1f, v * 0.10f)
 
     private fun fmt1(v: Float): String = String.format(Locale.US, "%.1f", v)
     private fun lowText(v: Float): String? = if (v <= 0f) null else fmt1(v)
@@ -352,6 +391,88 @@ class FusionHudView(
     }
 
     private fun gap(unitPx: Float) = Span("  ", colDim, unitPx)
+
+    // ---- Wayland HDR state (one line of its own; nothing at all for FusionHdr.NONE) ----
+    /** The state as a full line: "HDR", "HDR (no headroom)", "HDR off", "HDR ready", "HDR tone-mapped",
+     *  "HDR not on this screen". */
+    private fun hdrLine(px: Float): List<Span> = when (hdrState) {
+        FusionHdr.ON -> listOf(Span("HDR", colHdr, px))
+        FusionHdr.NO_HEADROOM -> listOf(Span("HDR", colHdr, px), Span(" (no headroom)", colBat, px))
+        FusionHdr.OFF -> listOf(Span("HDR off", colDim, px))
+        FusionHdr.READY -> listOf(Span("HDR ready", colDim, px))
+        FusionHdr.TONEMAPPED -> listOf(Span("HDR", colDim, px), Span(" tone-mapped", colBat, px))
+        FusionHdr.NOT_ON_THIS_SCREEN -> listOf(Span("HDR", colDim, px), Span(" not on this screen", colBat, px))
+        else -> emptyList()
+    }
+    /** The value after an "HDR" label (Full / Mega): "on", "no headroom", "off", "ready", "tone-mapped",
+     *  "not on this screen". */
+    private fun hdrValue(px: Float): List<Span> = when (hdrState) {
+        FusionHdr.ON -> listOf(Span("on", colHdr, px))
+        FusionHdr.NO_HEADROOM -> listOf(Span("no headroom", colBat, px))
+        FusionHdr.OFF -> listOf(Span("off", colDim, px))
+        FusionHdr.READY -> listOf(Span("ready", colDim, px))
+        FusionHdr.TONEMAPPED -> listOf(Span("tone-mapped", colBat, px))
+        FusionHdr.NOT_ON_THIS_SCREEN -> listOf(Span("not on this screen", colBat, px))
+        else -> emptyList()
+    }
+    private fun hdrText(): String = hdrLine(1f).joinToString("") { it.text }
+
+    // ---- GPU model (with the Wayland GPU-name spoof) ----
+    /** What the GPU row names: the spoofed GPU when this session reports one, else the real model. */
+    private fun gpuNameText(): String = gpuSpoofName.ifBlank { gpuModel }
+    /** The GPU row's value run. A spoofed name carries a marker in the same warning colour the HDR line
+     *  qualifies its state with, so the row can't be read as the chip that is really rendering:
+     *  "GeForce GTX 1080 (spoof)", and where the line is tightest (the pill) "GeForce GTX 1080 spoof". */
+    private fun gpuModelSpans(px: Float, color: Int, compact: Boolean = false): List<Span> {
+        val name = Span(gpuNameText(), color, px)
+        if (gpuSpoofName.isBlank()) return listOf(name)
+        return listOf(name, Span(if (compact) " spoof" else " (spoof)", colBat, px))
+    }
+
+    /**
+     * The pill is drawn as a capsule (radius = height / 2), so a line near the top or bottom of the stack
+     * sits where the rounded ends curve in: it can fit the bounding box and still run across the outline
+     * (the HDR line under the latency line did, on the Fold). Shift the content right and widen the pill
+     * until every glyph's ink clears both rounded ends, the outline and a small margin. The height is
+     * final by now, and with it the radius.
+     */
+    private val inkRect = android.graphics.Rect()
+    /** Clearance kept between glyph ink and the capsule outline. */
+    private fun capsuleMargin(): Float = (if (outlineIntensity > 0f) outlineIntensity * sp(3.5f) else 0f) + sp(2f)
+    /** How far the capsule's rounded end curves in over the band [top, bottom] (radius = contentH / 2). */
+    private fun capsuleCurveIn(top: Float, bottom: Float): Float {
+        val r = contentH / 2f
+        val dy = max(r - top, bottom - r)
+        if (dy <= 0f) return 0f
+        if (dy >= r) return r
+        return r - kotlin.math.sqrt(r * r - dy * dy)
+    }
+    private fun fitCapsule() {
+        if (contentW <= 0f || contentH <= 0f || glyphs.isEmpty()) return
+        val margin = capsuleMargin()
+        fun curveIn(top: Float, bottom: Float): Float = capsuleCurveIn(top, bottom)
+        var shift = 0f
+        for (g in glyphs) {
+            measurePaint.textSize = g.sizePx
+            measurePaint.getTextBounds(g.text, 0, g.text.length, inkRect)
+            if (inkRect.isEmpty) continue
+            val need = curveIn(g.baseline + inkRect.top, g.baseline + inkRect.bottom) + margin
+            shift = max(shift, need - (g.x + inkRect.left))
+        }
+        var w = contentW + shift
+        for (g in glyphs) {
+            measurePaint.textSize = g.sizePx
+            measurePaint.getTextBounds(g.text, 0, g.text.length, inkRect)
+            if (inkRect.isEmpty) continue
+            val need = curveIn(g.baseline + inkRect.top, g.baseline + inkRect.bottom) + margin
+            w = max(w, g.x + shift + inkRect.right + need)
+        }
+        if (shift > 0f) {
+            val moved = glyphs.map { Glyph(it.x + shift, it.baseline, it.text, it.color, it.sizePx) }
+            glyphs.clear(); glyphs.addAll(moved)
+        }
+        contentW = w
+    }
 
     // ---- Layout builders --------------------------------------------------
     private fun rebuild() {
@@ -431,8 +552,12 @@ class FusionHudView(
         val pad = sp(10f); val lineGap = sp(4f); val lvGap = sp(8f)
         val rows = ArrayList<HudRow>()
 
-        if (showGpuModel && gpuModel.isNotBlank())
-            rows.add(HudRow(Span("GPU", colGpu, rowPx), listOf(Span(gpuModel, colValue, rowPx))))
+        if (showGpuModel && gpuNameText().isNotBlank())
+            rows.add(HudRow(Span("GPU", colGpu, rowPx), gpuModelSpans(rowPx, colValue)))
+        if (displayServer.isNotBlank())
+            rows.add(HudRow(Span("DISP", colDisp, rowPx), listOf(Span(displayServer, colValue, rowPx))))
+        if (hdrState != FusionHdr.NONE)
+            rows.add(HudRow(Span("HDR", colHdr, rowPx), hdrValue(rowPx)))
         if (showGPU) {
             val v = ArrayList<Span>()
             v += numUnit(s.gpuPercent?.toString(), "%", rowPx, unitPx)
@@ -541,8 +666,11 @@ class FusionHudView(
         if (showEngine && engineLabel.isNotBlank())
             tiles.add(Tile("API", colFps, listOf(Span(engineLabel, colValue, valPx)),
                 dxVersion().ifBlank { null }, false))
-        if (showGpuModel && gpuModel.isNotBlank())
-            tiles.add(Tile("GPU", colGpu, listOf(Span(gpuModel, colValue, valPx)), null, true))
+        if (displayServer.isNotBlank())
+            tiles.add(Tile("DISPLAY", colDisp, listOf(Span(displayServer, colValue, valPx)),
+                if (hdrState != FusionHdr.NONE) hdrText() else null, false))
+        if (showGpuModel && gpuNameText().isNotBlank())
+            tiles.add(Tile("GPU", colGpu, gpuModelSpans(valPx, colValue), null, true))
         if (showBattery || showPower || showBatteryTemp) {
             val parts = ArrayList<Span>(); var any = false
             if (showBattery && s.battery.percent != null) { parts += numUnit(s.battery.percent.toString(), "%", valPx, unitPx); any = true }
@@ -595,11 +723,21 @@ class FusionHudView(
         val pad = sp(10f); val midGap = sp(12f); val stkLineGap = sp(3f)
 
         val left = ArrayList<Span>()
-        left += Span(fpsText(fpsNow), colValue, bigPx)
-        left += Span("fps", colDim, bigUnitPx)
+        // "30->118" is roughly three times the width of "30", and the pill's
+        // number is set at 30sp precisely because it is the one big thing on a
+        // small overlay. Shrink it while it carries both figures so the pill
+        // does not balloon across the screen; it is still the largest element.
+        val generating = differs(fpsNow)
+        val fpsPx = if (generating) bigPx * 0.55f else bigPx
+        left += Span(fpsText(fpsNow), colValue, fpsPx)
+        left += Span("fps", colDim, if (generating) bigUnitPx * 0.8f else bigUnitPx)
 
         val stack = ArrayList<List<Span>>()
-        if (showGpuModel && gpuModel.isNotBlank()) stack.add(listOf(Span(gpuModel, colDim, stkPx)))
+        // The GPU name normally heads the stack. A name wider than every stat under it (a Wayland spoof
+        // such as "Radeon RX 6800/6800 XT / 6900 XT spoof") would set the stack's width and stretch the
+        // whole capsule around empty space, so that name gets its own line across the top of the pill
+        // instead, starting over the API caption (see nameOnTop below).
+        val gpuName = if (showGpuModel && gpuNameText().isNotBlank()) gpuModelSpans(stkPx, colDim, compact = true) else null
         run {
             val l = ArrayList<Span>()
             if (showGPU) { l += Span("GPU ${s.gpuPercent ?: "—"}%", colGpu, stkPx) }
@@ -609,7 +747,18 @@ class FusionHudView(
         // RAM % (system-wide) takes the slot the latency row used to occupy, matching the GPU/CPU idiom
         // on the row above it. colRam keeps RAM's identity colour consistent with the Full/Tiles sizes.
         if (showRAM) {
-            stack.add(listOf(Span("RAM ${s.ramPercent.roundToInt()}%", colRam, stkPx)))
+            val l = ArrayList<Span>()
+            l += Span("RAM ${s.ramPercent.roundToInt()}%", colRam, stkPx)
+            // Battery temperature as a "BAT" chip right after RAM (pill-only placement, per user
+            // request). Colour-banded warm→red via tempSpans/TempSensor.BATTERY — the exact same
+            // danger bands the GPU/CPU temps use. Only shown when the battery-temp toggle is on
+            // and a reading is available; the other sizes keep battery temp in the battery row.
+            if (showBatteryTemp && s.battery.tempC != null) {
+                l += Span(" · ", colDim, stkPx)
+                l += Span("BAT ", colBat, stkPx)
+                l += tempSpans(s.battery.tempC, HudMetrics.TempSensor.BATTERY, stkPx, stkPx * 0.62f)
+            }
+            stack.add(l)
         }
         if (showBattery || showPower) {
             val l = ArrayList<Span>(); var any = false
@@ -617,13 +766,24 @@ class FusionHudView(
             if (showPower && s.battery.watts > 0f) { if (any) l += Span(" · ", colDim, stkPx); l += Span("${fmt1(s.battery.watts)}W", colDim, stkPx) }
             if (any) stack.add(l)
         }
-        // Latency (+ optional VRAM) drops to the bottom of the stack, under the battery row.
+        // Latency (+ the display server, + optional VRAM) drops to the bottom of the stack, under the
+        // battery row. The display server sits here, not on the GPU-model line: that line is the
+        // pill's widest and ran into the capsule's rounded edge.
         run {
             val l = ArrayList<Span>()
             l += Span("${fmt1(1000f / max(fpsNow, 1f))}ms", colDim, stkPx)
+            if (displayServer.isNotBlank()) { l += Span(" · ", colDim, stkPx); l += Span(displayServer, colDisp, stkPx) }
             if (showVram && s.vramText() != null) { l += Span(" · ", colDim, stkPx); l += Span("${s.vramText()} vram", colDim, stkPx) }
             stack.add(l)
         }
+        // Wayland HDR state on its OWN line directly under the latency · display-server line (it ran off
+        // the capsule's right edge as "40.3ms · Wayland · HDR (no headroom)"). Only in HDR sessions.
+        if (hdrState != FusionHdr.NONE) stack.add(hdrLine(stkPx))
+
+        var statsW = 0f
+        for (l in stack) statsW = max(statsW, runWidth(l))
+        val nameOnTop = gpuName != null && runWidth(gpuName) > statsW
+        if (gpuName != null && !nameOnTop) stack.add(0, gpuName)
 
         // Left column: a small API/engine caption (DXVK/VKD3D/Zink) centred ABOVE the big FPS — mirroring
         // the clock centred BELOW it, so the left reads API · FPS · clock top-to-bottom.
@@ -641,23 +801,43 @@ class FusionHudView(
         for (l in stack) stackW = max(stackW, runWidth(l))
         val stackTotalH = stack.size * stkH + (stack.size - 1).coerceAtLeast(0) * stkLineGap
         val innerH = max(leftColH, stackTotalH)
+        val topLineH = if (nameOnTop) stkH + stkLineGap else 0f
         contentW = pad + leftBlockW + midGap + stackW + pad
-        contentH = pad + innerH + pad
+        contentH = pad + topLineH + innerH + pad
 
         // left column (API caption + big FPS), vertically centered as a block
-        var ly = pad + (innerH - leftColH) / 2f
+        var ly = pad + topLineH + (innerH - leftColH) / 2f
         if (hasApi) {
             placeRun(pad + (leftBlockW - apiW) / 2f, ly - ascent(stkPx), listOf(Span(apiStr, colFps, stkPx)))
             ly += apiH + apiGap
         }
         placeRun(pad + (leftBlockW - leftW) / 2f, ly - ascent(bigPx), left)
         // stack, vertically centered
-        var sy = pad + (innerH - stackTotalH) / 2f
+        var sy = pad + topLineH + (innerH - stackTotalH) / 2f
         for (l in stack) {
             placeRun(pad + leftBlockW + midGap, sy - ascent(stkPx), l)
             sy += stkH + stkLineGap
         }
         addSubtleClock(pad, pad + leftBlockW / 2f)   // clock centred under the FPS (left of the pill centre)
+        if (nameOnTop && gpuName != null) {
+            // Left-aligned over the API caption, pulled in just far enough to clear the rounded end at
+            // this height; the pill only widens if the name is wider than the API/FPS column + stats.
+            val baseline = pad - ascent(stkPx)
+            var inkTop = 0f; var inkBottom = 0f
+            for (span in gpuName) {
+                measurePaint.textSize = span.sizePx
+                measurePaint.getTextBounds(span.text, 0, span.text.length, inkRect)
+                if (inkRect.isEmpty) continue
+                inkTop = min(inkTop, inkRect.top.toFloat()); inkBottom = max(inkBottom, inkRect.bottom.toFloat())
+            }
+            val clear = capsuleCurveIn(baseline + inkTop, baseline + inkBottom) + capsuleMargin()
+            val x = max(pad, clear)
+            placeRun(x, baseline, gpuName)
+            contentW = max(contentW, x + runWidth(gpuName) + max(pad, clear))
+        }
+        // HDR sessions: the extra line makes the capsule taller and its ends rounder - make sure nothing
+        // crosses the outline. (Without the HDR line the pill is exactly what it always was.)
+        if (hdrState != FusionHdr.NONE) fitCapsule()
         // Capsule border captured AFTER the footer clock so the pill encloses it too.
         pillBorder = RectF(0f, 0f, contentW, contentH)
     }
@@ -666,7 +846,11 @@ class FusionHudView(
         val bigPx = sp(34f); val bigUnitPx = bigPx * 0.32f; val subPx = sp(11.5f)
         val pad = sp(10f); val lineGap = sp(6f)
 
-        val big = listOf(Span(fpsText(fpsNow), colValue, bigPx), Span("fps", colDim, bigUnitPx))
+        // Same reasoning as the pill: 34sp is sized for one number, not two.
+        val minGenerating = differs(fpsNow)
+        val big = listOf(
+            Span(fpsText(fpsNow), colValue, if (minGenerating) bigPx * 0.55f else bigPx),
+            Span("fps", colDim, if (minGenerating) bigUnitPx * 0.8f else bigUnitPx))
         val sub = ArrayList<Span>()
         sub += Span("1% ", colDim, subPx); sub += Span(lowText(lows.low1Fps) ?: "—", colFps, subPx)
         sub += Span("  ·  0.1% ", colDim, subPx); sub += Span(lowText(lows.low01Fps) ?: "—", colFps, subPx)
@@ -694,17 +878,28 @@ class FusionHudView(
         // Small API/engine label (DXVK/VKD3D/Zink), bottom-LEFT, near the graph — balances the subtle
         // clock on the bottom-right (both share the same footer line). Gated by the "Engine" chip. Placed
         // BEFORE addSubtleClock so both read the same footerTop (= contentH - pad).
-        if (showEngine && engineLabel.isNotBlank()) {
+        val footerLabel = listOf(if (showEngine) engineLabel else "", displayServer)
+            .filter { it.isNotBlank() }.joinToString(" · ")
+        if (footerLabel.isNotBlank()) {
             val apiPx = sp(9.5f)
             val footerTop = contentH - pad
-            glyphs.add(Glyph(pad, footerTop - ascent(apiPx), engineLabel, blend(colDim), apiPx))
-            val apiW = measure(engineLabel, apiPx)
+            glyphs.add(Glyph(pad, footerTop - ascent(apiPx), footerLabel, blend(colDim), apiPx))
+            val apiW = measure(footerLabel, apiPx)
             val clockW = if (showClockTime) measure(clockTimeString(), apiPx) else 0f
             contentW = max(contentW, pad + apiW + sp(12f) + clockW + pad)
             // The clock (when shown) grows contentH for the footer line; when it's hidden, do it here.
             if (!showClockTime) contentH = footerTop + lineH(apiPx) + pad * 0.5f
         }
         addSubtleClock(pad)
+        // Wayland HDR state on its own line under the footer (engine · display server), HDR sessions only.
+        if (hdrState != FusionHdr.NONE) {
+            val px = sp(9.5f)
+            val line = hdrLine(px)
+            val top = contentH - pad * 0.5f + sp(1f)
+            val end = placeRun(pad, top - ascent(px), line)
+            contentH = top + lineH(px) + pad * 0.5f
+            contentW = max(contentW, end + pad)
+        }
     }
 
     /** Places a column of "label + value" rows; returns (bottomY, rightX). Appends glyphs. Rows flagged
@@ -751,8 +946,8 @@ class FusionHudView(
 
         // ---- LEFT column: GPU, aggregate CPU, then per-core rows ----
         val left = ArrayList<HudRow>()
-        if (showGpuModel && gpuModel.isNotBlank())
-            left.add(HudRow(Span("GPU", colGpu, rowPx), listOf(Span(gpuModel, colValue, rowPx))))
+        if (showGpuModel && gpuNameText().isNotBlank())
+            left.add(HudRow(Span("GPU", colGpu, rowPx), gpuModelSpans(rowPx, colValue)))
         if (showGPU) {
             val v = ArrayList<Span>()
             v += numUnit(s.gpuPercent?.toString(), "%", rowPx, unitPx)
@@ -840,6 +1035,8 @@ class FusionHudView(
         // (The graphics wrapper moved to the FPS-row label above, so it's no longer in this band.)
         val band = ArrayList<List<Span>>()
         if (showResolution) band.add(listOf(Span("RES ", colDim, bandPx), Span(resolutionString(), colValue, bandPx)))
+        if (displayServer.isNotBlank()) band.add(listOf(Span("DISP ", colDim, bandPx), Span(displayServer, colDisp, bandPx)))
+        if (hdrState != FusionHdr.NONE) band.add(listOf(Span("HDR ", colDim, bandPx)) + hdrValue(bandPx))
         if (showProton && wineVersion.isNotBlank()) band.add(listOf(Span(wineVersion, colVram, bandPx)))
         if (showSession) band.add(listOf(Span("elapsed ", colDim, bandPx), Span(elapsedString(), colValue, bandPx)))
         if (band.isNotEmpty()) {
