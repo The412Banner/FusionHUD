@@ -20,6 +20,7 @@ import com.winlator.star.core.GPUInformation
 import com.winlator.star.ui.theme.AppThemeState
 import com.winlator.star.widget.FpsCounter
 import com.winlator.star.widget.exportHudDiagnostics
+import com.winlator.star.widget.fusionhud.FusionHdr
 import com.winlator.star.widget.fusionhud.FusionHudView
 import com.winlator.star.widget.fusionhud.FusionSize
 
@@ -33,7 +34,10 @@ import com.winlator.star.widget.fusionhud.FusionSize
  * onAttachedToWindow), reading this device's real procfs/sysfs via its internal HudMetrics.
  *
  * Buttons cycle the Fusion SIZE (Full/Tiles/Pill/Minimal/Mega), the accent colour, the lock state, and
- * export a HUD diagnostics report — the same surfaces an integrator would wire.
+ * export a HUD diagnostics report — the same surfaces an integrator would wire. A second row shows the
+ * readouts a host sets itself (all off by default): frames reaching the screen when something adds or
+ * drops frames after the game (setPresentedFps), the display server (setDisplayServer), the HDR state
+ * (setHdrState) and a GPU name reported to games instead of the real one (setGpuSpoofName).
  */
 class DemoActivity : AppCompatActivity() {
 
@@ -44,6 +48,10 @@ class DemoActivity : AppCompatActivity() {
     private lateinit var hud: FusionHudView
     private lateinit var sizeButton: Button
     private lateinit var lockButton: Button
+    private lateinit var frameGenButton: Button
+    private lateinit var displayButton: Button
+    private lateinit var hdrButton: Button
+    private lateinit var gpuNameButton: Button
 
     private val accents = listOf(0xFFA374FF.toInt(), 0xFF00E5FF.toInt(), 0xFFFF5252.toInt(), 0xFF69F0AE.toInt())
 
@@ -51,10 +59,26 @@ class DemoActivity : AppCompatActivity() {
     private var accentIndex = 0
     private var locked = false
 
+    // Shown frames per game frame; 0 = nothing changes the frame count after the game.
+    private val frameGenModes = listOf("off" to 0f, "×2" to 2f, "×3" to 3f, "frames lost" to 0.5f)
+    private val displayServers = listOf("off" to "", "X11" to "X11", "Wayland" to "Wayland")
+    private val hdrStates = listOf(
+        "off" to FusionHdr.NONE, "on" to FusionHdr.ON, "no headroom" to FusionHdr.NO_HEADROOM,
+        "switched off" to FusionHdr.OFF, "ready" to FusionHdr.READY, "tone-mapped" to FusionHdr.TONEMAPPED,
+        "not on this screen" to FusionHdr.NOT_ON_THIS_SCREEN
+    )
+    private val spoofGpuName = "AMD Radeon RX 6800"
+    private var frameGenIndex = 0
+    private var displayIndex = 0
+    private var hdrIndex = 0
+    private var gpuSpoofed = false
+
     // Choreographer drives both the fake game's animation and the authoritative FPS tick.
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             fpsCounter.tick()
+            // A host with frame generation reports what reaches the panel; the demo fakes it from its own rate.
+            hud.setPresentedFps(fpsCounter.currentFPS * frameGenModes[frameGenIndex].second)
             background.invalidate()
             Choreographer.getInstance().postFrameCallback(this)
         }
@@ -127,9 +151,12 @@ class DemoActivity : AppCompatActivity() {
 
     private fun buildControlBar(): View {
         val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         sizeButton = button("Size: " + FusionSize.values()[sizeIndex].label) {
             sizeIndex = (sizeIndex + 1) % FusionSize.values().size
             sizeButton.text = "Size: " + FusionSize.values()[sizeIndex].label
@@ -149,7 +176,29 @@ class DemoActivity : AppCompatActivity() {
             // Standalone defaults: writes to the app-specific external dir (no permission), no share sheet.
             exportHudDiagnostics(this)
         }
-        bar.addView(sizeButton); bar.addView(lockButton); bar.addView(accentButton); bar.addView(diagButton)
+        row1.addView(sizeButton); row1.addView(lockButton); row1.addView(accentButton); row1.addView(diagButton)
+
+        frameGenButton = button("Frame gen: " + frameGenModes[frameGenIndex].first) {
+            frameGenIndex = (frameGenIndex + 1) % frameGenModes.size
+            frameGenButton.text = "Frame gen: " + frameGenModes[frameGenIndex].first
+        }
+        displayButton = button("Display: " + displayServers[displayIndex].first) {
+            displayIndex = (displayIndex + 1) % displayServers.size
+            displayButton.text = "Display: " + displayServers[displayIndex].first
+            hud.setDisplayServer(displayServers[displayIndex].second)
+        }
+        hdrButton = button("HDR: " + hdrStates[hdrIndex].first) {
+            hdrIndex = (hdrIndex + 1) % hdrStates.size
+            hdrButton.text = "HDR: " + hdrStates[hdrIndex].first
+            hud.setHdrState(hdrStates[hdrIndex].second)
+        }
+        gpuNameButton = button("GPU name: real") {
+            gpuSpoofed = !gpuSpoofed
+            gpuNameButton.text = if (gpuSpoofed) "GPU name: spoofed" else "GPU name: real"
+            hud.setGpuSpoofName(if (gpuSpoofed) spoofGpuName else null)
+        }
+        row2.addView(frameGenButton); row2.addView(displayButton); row2.addView(hdrButton); row2.addView(gpuNameButton)
+        bar.addView(row1); bar.addView(row2)
 
         // A full-size holder so the (wrap-content) button bar pins to the bottom-centre of the root.
         return FrameLayout(this).apply {

@@ -33,7 +33,7 @@ FusionHUD ships a **single** overlay — the MangoHud-inspired **Fusion** style 
 |------|-------|---------------|
 | **Full** | `full` | Standard chip set: FPS (+graph, 0.01% low), GPU / GPU-temp, CPU, VRAM, RAM, Power, Temp, Battery, GPU model, Engine, Clock. |
 | **Tiles** | `tiles` | Same standard chip set, laid out as tiles. |
-| **Pill** | `pill` | Compact pill: FPS (+graph), GPU, CPU, VRAM, Battery, GPU model, Clock. |
+| **Pill** | `pill` | Compact pill: FPS (+graph), GPU, CPU, VRAM, RAM, Battery (+ battery temperature), GPU model, Clock. A GPU name wider than the stats gets its own line across the top. |
 | **Minimal** | `minimal` | Just FPS (+graph, 0.01% low, decimal) and a subtle Clock. |
 | **Mega** | `mega` | Everything in Full **plus** per-core CPU, Swap, Network, Resolution, Proton, Wrapper, DX version, Session length. |
 
@@ -49,6 +49,10 @@ every size.
 - RAM, VRAM, swap, per-core CPU load + clock, network up/down (Mega).
 - Battery %, power (W), temperature, and a smoothed runtime-left estimate.
 - Engine / GPU-model / Wine(Proton) / wrapper / DXVK / VKD3D labels you feed from your emulator.
+- Optional readouts your app sets itself (nothing is drawn until you set them): the frame rate reaching the
+  screen next to the game's own rate when something adds or drops frames after the game (`60→120`), the
+  display server (X11 / Wayland), an HDR state line, and a GPU name reported to games in place of the real
+  one. See step 7 of the integration guide.
 - Configurable accent colour, background opacity, outline, scale, and clock.
 - **Cross-vendor metric probing** (below) so the same build lights up on Adreno, Mali, PowerVR, Xclipse/
   amdgpu, panfrost, MediaTek and Exynos parts.
@@ -66,8 +70,9 @@ cached. Highlights (full detail in [docs/FUSION_HUD.md](docs/FUSION_HUD.md)):
 - **CPU** — `/proc/stat` aggregate delta, with a `scaling_cur_freq / cpuinfo_max_freq` fallback where
   `/proc/stat` is restricted; per-core % and clock from `cpufreq`.
 - **GPU load / clock — cross-vendor** — an ordered static candidate list (Adreno KGSL `gpubusy`; Mali
-  `misc/mali0` + Exynos `gpusysfs`; PowerVR `pvr`; amdgpu/Xclipse `drm/card0/.../gpu_busy_percent`) **plus**
-  a dynamic scan of `/sys/devices/platform/*` and `/sys/class/devfreq` for any node whose name contains a
+  `misc/mali0` + Exynos `gpusysfs`; PowerVR `pvr`; amdgpu/Xclipse `drm/card0/.../gpu_busy_percent`;
+  MediaTek GED `/sys/kernel/ged/hal/gpu_utilization` + `/sys/module/ged/parameters/gpu_loading`; GED clock
+  nodes) **plus** a dynamic scan of `/sys/devices/platform/*` and `/sys/class/devfreq` for any node whose name contains a
   GPU token (`gpu`, `mali`, `g3d`, `kgsl`, `panfrost`, `pvr`, `powervr`, `xclipse`, `sgpu`). Each filename
   shape (Adreno `gpubusy` busy/total, Mali `gpuinfo` delta-over-wall-clock, plain percent) is parsed
   correctly. Discovery cached.
@@ -79,7 +84,8 @@ cached. Highlights (full detail in [docs/FUSION_HUD.md](docs/FUSION_HUD.md)):
   A vendor-agnostic `VK_EXT_memory_budget` fallback is a documented **TODO(native)** (needs an NDK rebuild).
 - **Battery** — `BatteryManager` for %, current, charge-counter, temperature; power is the current×voltage
   magnitude (the `current_now` sign convention is OEM-dependent, so charge *direction* comes from
-  `EXTRA_PLUGGED`).
+  `EXTRA_PLUGGED`). When the framework reports no charge state, `/sys/class/power_supply/*` is checked
+  instead.
 
 Reads are all standard app-sandbox reads — **no runtime permission and no root required**. Nodes a device
 doesn't expose simply return `null` and that row hides itself.
@@ -136,6 +142,13 @@ AppThemeState.setCurrentAccentArgb(0xFF00E5FF.toInt())
 hud.setOnSizeCycledListener { token -> saveHudSize(token) }
 hud.setOnMovedListener { x, y -> saveHudPosition(x, y) }
 hud.setOnLockChangedListener { locked -> saveHudLocked(locked) }
+
+// 7. Optional readouts (all off by default; set them only if your app knows the value).
+hud.setPresentedFps(shownFps)            // frames reaching the screen; the FPS reads "60→120" when it differs
+                                         // from the game's rate by more than 10 %; 0 = off
+hud.setDisplayServer("Wayland")         // or "X11"; null / "" = off
+hud.setHdrState(FusionHdr.ON)            // FusionHdr.NONE (default) draws no HDR line
+hud.setGpuSpoofName("AMD Radeon RX 6800") // the name games are told; marked as such on the GPU row
 ```
 
 `FusionHudView` **self-refreshes** — a coroutine on the main dispatcher, started in `onAttachedToWindow`
@@ -163,7 +176,8 @@ toasts the path; the share sheet is only built when `fileProviderAuthority != nu
 
 See the **`:demo`** module (`DemoActivity`) for a complete, runnable example — a fake animated "game" with
 the HUD overlaid, FPS ticked via `Choreographer`, and buttons to cycle size / accent / lock and export
-diagnostics.
+diagnostics. A second row of buttons turns on the optional readouts: frame generation (×2, ×3, or frames
+lost), the display server (X11 / Wayland), each HDR state, and a spoofed GPU name.
 
 ## Credits / Required Attribution
 

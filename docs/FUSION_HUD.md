@@ -51,12 +51,13 @@ drawn. `buildConfig()` always emits every key regardless (hiding a chip is purel
 
 | Size | Chips rendered |
 |------|----------------|
-| **Minimal** | `FPS`, `FPS graph`, `0.01% low`, `FPS .1`, `Clock` |
-| **Pill** | `FPS`, `FPS graph`, `GPU`, `CPU`, `VRAM`, `Battery`, `GPU model`, `FPS .1`, `Clock` |
+| **Minimal** | `FPS`, `FPS graph`, `0.01% low`, `FPS .1`, `Engine`, `Clock` |
+| **Pill** | `FPS`, `FPS graph`, `GPU`, `CPU`, `VRAM`, `RAM`, `Battery`, `GPU model`, `FPS .1`, `Engine`, `Clock` |
 | **Full** / **Tiles** | `FPS`, `FPS graph`, `GPU`, `GPU temp`, `CPU`, `VRAM`, `RAM`, `Power`, `Temp`, `Battery`, `GPU model`, `Engine`, `0.01% low`, `FPS .1`, `Clock` |
 | **Mega** | the Full set **plus** `Per-core`, `Swap`, `Network`, `Resolution`, `Proton`, `Wrapper`, `DX ver`, `Session` |
 
-`Clock` (a subtle corner time readout) is in every set. The visual language (colours, accent, outline) is
+On Pill the battery temperature is drawn as a `BAT °C` chip after RAM, and a GPU name wider than the stats
+gets its own line across the top. `Clock` (a subtle corner time readout) is in every set. The visual language (colours, accent, outline) is
 shared across all sizes; only the amount of detail changes. The accent colour comes from
 `ui.theme.AppThemeState.getCurrentAccentArgb()`.
 
@@ -122,7 +123,9 @@ Read paths, metric by metric:
   and the sticky `ACTION_BATTERY_CHANGED` intent (`EXTRA_VOLTAGE`, `EXTRA_TEMPERATURE`, `EXTRA_STATUS`).
   Power = |current| × voltage. **Sign quirk:** `current_now`'s sign convention is OEM-dependent (several
   OEMs report discharge as positive), so wattage uses the magnitude and the reliable charge *direction*
-  comes from `EXTRA_PLUGGED`/`EXTRA_STATUS`. Runtime-left = charge_counter / current, smoothed and clamped
+  comes from `EXTRA_PLUGGED`/`EXTRA_STATUS`. Only when the framework gives no usable charge state
+  (`EXTRA_STATUS` unknown or no battery intent) does it check `/sys/class/power_supply/*`: a battery
+  `status` of Charging/Full, or a charger supply with `online == 1`, means charging. Runtime-left = charge_counter / current, smoothed and clamped
   to ≤72 h; "LEFT CHG" while charging.
 
 ## Cross-vendor probing
@@ -142,6 +145,8 @@ The GPU-load, GPU-clock and thermal readers were broadened (this is the CI-green
      `/sys/class/pvr/gpu_utilisation`
    - amdgpu / Samsung Xclipse ("sgpu"): `/sys/class/drm/card0/device/gpu_busy_percent`
    - generic devfreq: `/sys/class/devfreq/gpu/load`
+   - MediaTek GED: `/sys/kernel/ged/hal/gpu_utilization` ("<loading> <block> <idle>"),
+     `/sys/module/ged/parameters/gpu_loading` (plain percent)
 2. A scan of `/sys/devices/platform/*` for nodes whose (hashed/addressed) directory name contains a GPU
    token — catches things like `/sys/devices/platform/13000000.mali/...`.
 3. A walk of `/sys/class/devfreq` and `/sys/devices/virtual/devfreq` for any node whose path contains a
@@ -151,7 +156,8 @@ GPU tokens (`GPU_NODE_TOKENS`): `gpu`, `mali`, `g3d`, `kgsl`, `panfrost`, `pvr`,
 `sgpu`. Percent filenames scanned (`GPU_USAGE_FILES`): `gpu_busy_percentage`, `gpu_busy_percent`,
 `gpu_load`, `utilisation`, `utilization`, `load`, `gpu_busy`, `gpuinfo`.
 
-**GPU clock** — `GPU_CLOCK_PATHS` (Adreno KGSL, Mali vendor, Exynos `gpusysfs/gpu_clock`, generic devfreq)
+**GPU clock** — `GPU_CLOCK_PATHS` (Adreno KGSL, Mali vendor, Exynos `gpusysfs/gpu_clock`, MediaTek GED
+`/sys/kernel/ged/hal/current_freqency` (the vendor's spelling, kHz) and `.../gpu_clock` (MHz), generic devfreq)
 plus a vendor-agnostic devfreq walk for any `gpu/mali/panfrost/xclipse/sgpu` node's `cur_freq`.
 
 **Thermal ranking** — zones are ranked so the most representative sensor wins:
@@ -234,11 +240,21 @@ The report contains:
   the per-chip `show*` flags, `fpsDecimal`, and the temperature options. `Container.DEFAULT_FPS_COUNTER_CONFIG`
   is a ready-made default.
 - Labels: `setEngineLabel`, `setGpuModel`, `setWineVersion`, `setGraphicsWrapper` (and DXVK/VKD3D fields).
+- Optional host-set readouts (off by default, any thread):
+  - `setPresentedFps(Float)` — frames per second reaching the screen. `FpsCounter` counts the game's frames,
+    so it can't see frames added or lost after the game (frame generation, a compositor dropping frames).
+    When this differs from the game's rate by more than 10 % (and at least 1 fps) the FPS reads
+    `game→shown`, e.g. `30→118` or `60→45`; `0` = off.
+  - `setDisplayServer(String?)` — `"X11"` / `"Wayland"`, shown as a DISP row, tile or Pill suffix.
+  - `setHdrState(Int)` — a `FusionHdr` code (`NONE`, `ON`, `NO_HEADROOM`, `OFF`, `READY`, `TONEMAPPED`,
+    `NOT_ON_THIS_SCREEN`); `NONE` draws no HDR line.
+  - `setGpuSpoofName(String?)` — a GPU name reported to games in place of the real one; the GPU row
+    shows it, marked as a spoof.
 - Listeners: `setOnSizeCycledListener(Consumer<String>)` (fires with the new size token on tap),
   `setOnMovedListener(BiConsumer<Float,Float>)` (drag), `setOnLockChangedListener(Consumer<Boolean>)`
   (long-press lock).
 
-Supporting types: `FpsCounter`, `HudMetrics` (+ `Snapshot`, `TempDisplay`, `Battery`), `FusionSize`,
+Supporting types: `FpsCounter`, `HudMetrics` (+ `Snapshot`, `TempDisplay`, `Battery`), `FusionSize`, `FusionHdr`,
 `HudLockController`, and the diagnostics function.
 
 `AppThemeState.setCurrentAccentArgb(Int)` sets the accent every view reads. `GPUInformation.setRenderer` /
