@@ -145,7 +145,7 @@ struct Frames {
     std::mutex m;
     std::deque<std::pair<uint64_t, uint64_t>> times;  // (received, app frame time), last 10 s
     std::string engine;
-    uint32_t outW = 0, outH = 0;
+    uint32_t outW = 0, outH = 0, pid = 0;
     uint16_t refresh = 0;
     uint64_t sessionStart = 0;
 } g_frames;
@@ -183,6 +183,8 @@ void frame_reader() {
             memcpy(&ft, reinterpret_cast<const char *>(msg) + offsetof(mangoapp_msg_v1, app_frametime_ns), sizeof(ft));
 
         std::lock_guard<std::mutex> lock(g_frames.m);
+        if (bytes >= offsetof(mangoapp_msg_v1, pid) + sizeof(uint32_t))
+            memcpy(&g_frames.pid, reinterpret_cast<const char *>(msg) + offsetof(mangoapp_msg_v1, pid), 4);
         if (bytes >= offsetof(mangoapp_msg_v1, displayRefresh) + sizeof(uint16_t)) {
             memcpy(&g_frames.outW, reinterpret_cast<const char *>(msg) + offsetof(mangoapp_msg_v1, outputWidth), 4);
             memcpy(&g_frames.outH, reinterpret_cast<const char *>(msg) + offsetof(mangoapp_msg_v1, outputHeight), 4);
@@ -204,7 +206,8 @@ void frame_reader() {
 }
 
 struct FpsNow {
-    float fps = 0, avg = 0, low1 = 0, low01 = 0, low001 = 0;
+    float fps = 0, avg = 0, low1 = 0, low01 = 0, low001 = 0, minMs = 0, maxMs = 0;
+    uint32_t pid = 0;
     std::vector<float> graph;  // frame times in ms, oldest first
     std::string engine;
     uint32_t outW = 0, outH = 0;
@@ -220,6 +223,7 @@ FpsNow fps_now() {
     r.outW = g_frames.outW;
     r.outH = g_frames.outH;
     r.refresh = g_frames.refresh;
+    r.pid = g_frames.pid;
     if (g_frames.sessionStart) r.sessionSec = float(t - g_frames.sessionStart) / 1e9f;
     double sum1 = 0, sumAll = 0;
     size_t n1 = 0;
@@ -239,6 +243,8 @@ FpsNow fps_now() {
         const size_t start = all.size() > 120 ? all.size() - 120 : 0;
         for (size_t i = start; i < all.size(); i++) r.graph.push_back(float(all[i]) / 1e6f);
         std::sort(all.begin(), all.end(), std::greater<uint64_t>());
+        r.maxMs = float(all.front()) / 1e6f;
+        r.minMs = float(all.back()) / 1e6f;
         auto low = [&](double frac) {
             size_t i = std::min(all.size() - 1, size_t(double(all.size()) * frac));
             return float(1e9 / double(all[i]));
@@ -253,8 +259,10 @@ FpsNow fps_now() {
 // ---- System metrics (FusionHUD HudMetrics, the subset these sizes draw) ---------------------------
 
 struct Snapshot {
-    std::string gpuName;
-    int cpu = -1, gpu = -1, gpuMhz = -1;
+    std::string gpuName, proton;
+    int cpu = -1, gpu = -1, gpuMhz = -1, cpuMhz = -1;
+    std::vector<int> corePct, coreMhz;
+    long long ramUsed = -1, ramTotal = -1, vram = -1, swapUsed = -1, swapTotal = -1, netDown = -1, netUp = -1;
     float ramPct = -1, ramUsedGiB = -1, vramGiB = -1;
     int bat = -1;
     float batTemp = NAN, watts = 0, cpuTemp = NAN, gpuTemp = NAN;
@@ -267,21 +275,30 @@ struct Snapshot {
 // fallbacks, so the same build also reads a plain Android/Linux system.
 class Metrics {
 public:
-    Snapshot snapshot() {
+    Snapshot snapshot(uint32_t gamePid) {
         Snapshot s;
         s.gpuName = gpu_name();
-        s.cpu = cpu_percent();
+        cpu_stat(s);
         s.gpu = gpu_percent();
         s.gpuMhz = gpu_mhz();
+        core_clocks(s);
         ram(s);
-        s.vramGiB = vram_gib();
+        s.vram = vram_bytes();
+        if (s.vram > 0) s.vramGiB = float(double(s.vram) / (1024.0 * 1024.0 * 1024.0));
+        net(s);
         battery(s);
         temps(s);
+        s.proton = proton_of(gamePid);
         return s;
     }
 
 private:
     unsigned long long prevIdle = 0, prevTotal = 0;
+    std::vector<unsigned long long> prevCoreIdle, prevCoreTotal;
+    long long prevRx = -1, prevTx = -1;
+    uint64_t prevNetNs = 0;
+    uint32_t protonPid = 0;
+    std::string protonName;
     bool tempsFound = false;
     std::string cpuTempFile, gpuTempFile, batteryDir;
 
@@ -302,16 +319,45 @@ private:
         return cached;
     }
 
-    int cpu_percent() {
-        std::string l = read_line("/proc/stat");
-        unsigned long long u, n, sy, id, io = 0, irq = 0, sirq = 0, st = 0;
-        if (sscanf(l.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &sy, &id, &io, &irq, &sirq, &st) < 4) return -1;
-        const unsigned long long idle = id + io, total = u + n + sy + id + io + irq + sirq + st;
-        int pct = -1;
-        if (prevTotal && total > prevTotal) pct = int(std::lround(100.0 * double((total - prevTotal) - (idle - prevIdle)) / double(total - prevTotal)));
-        prevIdle = idle;
-        prevTotal = total;
-        return pct < 0 ? -1 : std::clamp(pct, 0, 100);
+    // Aggregate and per-core load from /proc/stat deltas (DroidDeck binds its own CpuStatComponent copy).
+    void cpu_stat(Snapshot &s) {
+        std::ifstream f("/proc/stat");
+        std::string line;
+        while (std::getline(f, line) && line.rfind("cpu", 0) == 0) {
+            unsigned long long u, n, sy, id, io = 0, irq = 0, sirq = 0, st = 0;
+            char name[16];
+            if (sscanf(line.c_str(), "%15s %llu %llu %llu %llu %llu %llu %llu %llu", name, &u, &n, &sy, &id, &io, &irq, &sirq, &st) < 5) continue;
+            const unsigned long long idle = id + io, total = u + n + sy + id + io + irq + sirq + st;
+            if (strcmp(name, "cpu") == 0) {
+                if (prevTotal && total > prevTotal)
+                    s.cpu = std::clamp(int(std::lround(100.0 * double((total - prevTotal) - (idle - prevIdle)) / double(total - prevTotal))), 0, 100);
+                prevIdle = idle;
+                prevTotal = total;
+                continue;
+            }
+            const int core = atoi(name + 3);
+            if (core < 0 || core > 255) continue;
+            if (int(prevCoreTotal.size()) <= core) {
+                prevCoreTotal.resize(core + 1, 0);
+                prevCoreIdle.resize(core + 1, 0);
+            }
+            if (int(s.corePct.size()) <= core) s.corePct.resize(core + 1, -1);
+            if (prevCoreTotal[core] && total > prevCoreTotal[core])
+                s.corePct[core] = std::clamp(int(std::lround(100.0 * double((total - prevCoreTotal[core]) - (idle - prevCoreIdle[core])) /
+                                                             double(total - prevCoreTotal[core]))), 0, 100);
+            prevCoreIdle[core] = idle;
+            prevCoreTotal[core] = total;
+        }
+    }
+
+    static void core_clocks(Snapshot &s) {
+        const long n = sysconf(_SC_NPROCESSORS_CONF);
+        for (long i = 0; i < n && i < 256; i++) {
+            long long khz;
+            const int mhz = read_long("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_cur_freq", khz) && khz > 0 ? int(khz / 1000) : 0;
+            s.coreMhz.push_back(mhz);
+            s.cpuMhz = std::max(s.cpuMhz, mhz > 0 ? mhz : -1);
+        }
     }
 
     static int gpu_percent() {
@@ -333,11 +379,60 @@ private:
         return -1;
     }
 
-    static float vram_gib() {
+    static long long vram_bytes() {
         long long v;
-        if (read_long("/run/droiddeck-hud/gpu-mem", v) && v > 0) return float(double(v) / (1024.0 * 1024.0 * 1024.0));
-        if (read_long("/sys/class/kgsl/kgsl/page_alloc", v) && v > 0) return float(double(v) / (1024.0 * 1024.0 * 1024.0));
+        if (read_long("/run/droiddeck-hud/gpu-mem", v) && v > 0) return v;
+        if (read_long("/sys/class/kgsl/kgsl/page_alloc", v) && v > 0) return v;
         return -1;
+    }
+
+    // Received and sent bytes per second over every interface but lo (/proc/net/dev).
+    void net(Snapshot &s) {
+        std::ifstream f("/proc/net/dev");
+        std::string line;
+        long long rx = 0, tx = 0;
+        bool any = false;
+        while (std::getline(f, line)) {
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string iface = line.substr(0, colon);
+            iface.erase(0, iface.find_first_not_of(' '));
+            if (iface.empty() || iface == "lo") continue;
+            long long v[9];
+            if (sscanf(line.c_str() + colon + 1, "%lld %lld %lld %lld %lld %lld %lld %lld %lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8]) != 9) continue;
+            rx += v[0];
+            tx += v[8];
+            any = true;
+        }
+        if (!any) return;
+        const uint64_t t = now_ns();
+        if (prevRx >= 0 && t > prevNetNs) {
+            const double sec = double(t - prevNetNs) / 1e9;
+            s.netDown = (long long)(double(std::max(0LL, rx - prevRx)) / sec);
+            s.netUp = (long long)(double(std::max(0LL, tx - prevTx)) / sec);
+        }
+        prevRx = rx;
+        prevTx = tx;
+        prevNetNs = t;
+    }
+
+    // The Proton build running the focused game: the first STEAM_COMPAT_TOOL_PATHS entry in its environment.
+    std::string proton_of(uint32_t pid) {
+        if (pid == protonPid) return protonName;
+        protonPid = pid;
+        protonName.clear();
+        if (!pid) return protonName;
+        std::ifstream f("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+        std::string var;
+        while (std::getline(f, var, '\0')) {
+            if (var.rfind("STEAM_COMPAT_TOOL_PATHS=", 0) != 0) continue;
+            std::string first = var.substr(24, var.find(':', 24) == std::string::npos ? std::string::npos : var.find(':', 24) - 24);
+            while (!first.empty() && first.back() == '/') first.pop_back();
+            const size_t slash = first.rfind('/');
+            protonName = slash == std::string::npos ? first : first.substr(slash + 1);
+            break;
+        }
+        return protonName;
     }
 
     static void ram(Snapshot &s) {
@@ -345,14 +440,22 @@ private:
         std::string key;
         long long val;
         std::string unit;
-        long long total = 0, avail = 0;
+        long long total = 0, avail = 0, swapTotal = -1, swapFree = -1;
         while (f >> key >> val >> unit) {
             if (key == "MemTotal:") total = val;
             else if (key == "MemAvailable:") avail = val;
+            else if (key == "SwapTotal:") swapTotal = val;
+            else if (key == "SwapFree:") swapFree = val;
         }
         if (total > 0) {
             s.ramPct = float(100.0 * double(total - avail) / double(total));
             s.ramUsedGiB = float(double(total - avail) / (1024.0 * 1024.0));
+            s.ramUsed = (total - avail) * 1024;
+            s.ramTotal = total * 1024;
+        }
+        if (swapTotal > 0) {
+            s.swapTotal = swapTotal * 1024;
+            s.swapUsed = std::max(0LL, swapTotal - std::max(0LL, swapFree)) * 1024;
         }
     }
 
@@ -454,7 +557,7 @@ constexpr ImU32 argb(uint32_t c) {  // 0xAARRGGBB → ImGui ABGR
 
 const uint32_t COL_GPU = 0xFF5EE08A, COL_CPU = 0xFF58A6FF, COL_VRAM = 0xFFC98BFF, COL_RAM = 0xFFFF7BC0,
                COL_BAT = 0xFFFFAB5E, COL_FPS = 0xFFFF6B6B, COL_GRAPH = 0xFF5EE08A, COL_VALUE = 0xFFF2F5F9,
-               COL_DIM = 0xFF9AA4B2, COL_TEMP_OK = 0xFF66BB6A, COL_TEMP_AMBER = 0xFFFFB74D, COL_TEMP_RED = 0xFFEF5350;
+               COL_DIM = 0xFF9AA4B2, COL_LO = 0xFFE4E8EE, COL_TEMP_OK = 0xFF66BB6A, COL_TEMP_AMBER = 0xFFFFB74D, COL_TEMP_RED = 0xFFEF5350;
 
 struct Span {
     std::string text;
@@ -488,21 +591,48 @@ public:
         position = c.get("hudPosition", "top-left");
         fahrenheit = c.get("tempUnit", "c") == "f";
         bands = c.get("tempBands", "1") != "0";
-        auto_ = c.get("tempAuto", "1") != "0";
         redCpu = c.num("tempRedCpu", 90, 30, 150);
         redGpu = c.num("tempRedGpu", 90, 30, 150);
         redBat = c.num("tempRedBat", 48, 20, 100);
+        // FusionHudView.applyConfig flags.
+        showFPS = c.on("showFPS", true);
+        showEngine = c.on("showEngine", true);
+        showGpuModel = c.on("showGpuModel", true);
+        showCPU = c.on("showCPUUsage", c.on("showCPULoad", true));
+        showGPU = c.on("showGPULoad", true);
+        showCpuTemp = c.on("showTemp", true);
+        showGpuTemp = c.on("showGpuTemp", false);
+        showVram = c.on("showVram", true);
+        showRAM = c.on("showRAM", true);
+        showBattery = c.on("showBattery", true);
+        showPower = c.on("showPower", true);
+        showBatteryTemp = c.on("showBatteryTemp", false);
+        showGraph = c.on("showFPSGraph", false);
+        showLow001 = c.on("showLow001", true);
+        fpsDecimal = c.on("fpsDecimal", true);
+        showClock = c.on("showClock", true);
+        showPerCore = c.on("showPerCore", true);
+        showSwap = c.on("showSwap", true);
+        showNet = c.on("showNet", true);
+        showResolution = c.on("showResolution", true);
+        showProton = c.on("showProton", true);
+        showSession = c.on("showSession", true);
     }
 
     // Lays out the current size; draw() then paints it at the configured corner of a w x h screen.
-    void build(const Snapshot &s, const FpsNow &f, float screenScale) {
+    void build(const Snapshot &s, const FpsNow &f, float screenScale, float sessionSec) {
         k = density * scale * screenScale;
         glyphs.clear();
+        tiles.clear();
         graphRect = false;
         capsule = false;
         contentW = contentH = 0;
         fps = f;
+        session = sessionSec;
         if (size == "minimal") build_minimal(f);
+        else if (size == "full") build_full(s, f);
+        else if (size == "tiles") build_tiles(s, f);
+        else if (size == "mega") build_mega(s, f);
         else build_pill(s, f);
     }
 
@@ -525,6 +655,11 @@ public:
             dl->AddRect(ImVec2(ox + h, oy + h), ImVec2(ox + contentW - h, oy + contentH - h),
                         argb(outlineAccent ? accent : 0xFFC8C8C8u), std::max(0.0f, radius - h), 0, strokeW);
         }
+        if (!tiles.empty()) {
+            const int a = std::clamp(int(std::lround(14.0f * bgOpacity)), 8, 40);
+            for (const auto &t : tiles)
+                dl->AddRectFilled(ImVec2(ox + t.x, oy + t.y), ImVec2(ox + t.z, oy + t.w), IM_COL32(255, 255, 255, a), sp(6.0f));
+        }
         for (const auto &g : glyphs)
             dl->AddText(font, g.px, ImVec2(ox + g.x, oy + g.baseline - ascent(g.px)), argb(g.col), g.text.c_str());
         if (graphRect && fps.graph.size() >= 2) {
@@ -539,13 +674,23 @@ public:
     }
 
 private:
+    struct HudRow {
+        Span label;
+        Run vals;
+    };
+
     Config cfg;
     std::string size = "pill", position = "top-left";
-    float scale = 1, bgOpacity = 0.8f, intensity = 1, outline = 0.4f, k = 2;
-    bool outlineAccent = true, fahrenheit = false, bands = true, auto_ = true;
+    float scale = 1, bgOpacity = 0.8f, intensity = 1, outline = 0.4f, k = 2, session = 0;
+    bool outlineAccent = true, fahrenheit = false, bands = true;
+    bool showFPS = true, showEngine = true, showGpuModel = true, showCPU = true, showGPU = true, showCpuTemp = true,
+         showGpuTemp = false, showVram = true, showRAM = true, showBattery = true, showPower = true, showBatteryTemp = false,
+         showGraph = false, showLow001 = true, fpsDecimal = true, showClock = true, showPerCore = true, showSwap = true,
+         showNet = true, showResolution = true, showProton = true, showSession = true;
     int redCpu = 90, redGpu = 90, redBat = 48;
     uint32_t accent = 0xFFA374FF;
     std::vector<Glyph> glyphs;
+    std::vector<ImVec4> tiles;  // x0, y0, x1, y1
     float contentW = 0, contentH = 0;
     bool capsule = false, graphRect = false;
     float gx0 = 0, gy0 = 0, gx1 = 0, gy1 = 0;
@@ -576,6 +721,7 @@ private:
         }
         return x;
     }
+    static void append(Run &to, const Run &from) { to.insert(to.end(), from.begin(), from.end()); }
     std::string fmt1(float v) const {
         char b[32];
         snprintf(b, sizeof b, "%.1f", v);
@@ -583,11 +729,25 @@ private:
     }
     std::string fpsText(float v) const {
         char b[32];
-        if (cfg.on("fpsDecimal", true)) snprintf(b, sizeof b, "%.1f", v);
+        if (fpsDecimal) snprintf(b, sizeof b, "%.1f", v);
         else snprintf(b, sizeof b, "%d", int(std::lround(v)));
         return b;
     }
     std::string lowText(float v) const { return v <= 0 ? "—" : fmt1(v); }
+    static std::string bytesGb(long long bytes) {  // HudMetrics.formatBytesGb
+        char b[32];
+        const double gb = double(bytes) / (1024.0 * 1024.0 * 1024.0);
+        if (gb >= 1.0) snprintf(b, sizeof b, "%.1fGiB", gb);
+        else snprintf(b, sizeof b, "%lldMiB", bytes / (1024 * 1024));
+        return b;
+    }
+    static std::string vramText(long long bytes) {  // HudMetrics.formatGiB
+        char b[32];
+        const double gib = double(bytes) / (1024.0 * 1024.0 * 1024.0);
+        if (gib >= 0.1) snprintf(b, sizeof b, "%.1fGiB", gib);
+        else snprintf(b, sizeof b, "%lldMiB", bytes / (1024 * 1024));
+        return b;
+    }
     std::string clockText() const {
         char b[32];
         time_t t = time(nullptr);
@@ -596,23 +756,122 @@ private:
         strftime(b, sizeof b, "%I:%M %p", &lt);
         return b[0] == '0' ? std::string(b + 1) : std::string(b);
     }
+    std::string elapsedText() const {
+        const int sec = std::max(0, int(session));
+        char b[32];
+        if (sec >= 3600) snprintf(b, sizeof b, "%d:%02d:%02d", sec / 3600, (sec % 3600) / 60, sec % 60);
+        else snprintf(b, sizeof b, "%02d:%02d", (sec % 3600) / 60, sec % 60);
+        return b;
+    }
+    std::string resolutionText(const FpsNow &f) const {
+        if (!f.outW || !f.outH) return "";
+        std::string r = std::to_string(f.outW) + "x" + std::to_string(f.outH);
+        if (f.refresh) r += " @ " + std::to_string(f.refresh) + "Hz";
+        return r;
+    }
     std::string apiLabel(const FpsNow &f) const {
-        if (!cfg.on("showEngine", true) || f.engine.empty() || f.engine == "gamescope") return "FPS";
+        if (!showEngine || f.engine.empty() || f.engine == "gamescope") return "FPS";
         return f.engine;
     }
+    Run numUnit(const std::string &num, const std::string &unit, float numPx, float unitPx) const {
+        if (num.empty()) return {{"—", COL_DIM, numPx}, {unit, COL_DIM, unitPx}};
+        return {{num, COL_VALUE, numPx}, {unit, COL_DIM, unitPx}};
+    }
+    static std::string num(int v) { return v < 0 ? "" : std::to_string(v); }
+    Run valueUnit(const std::string &text, float numPx, float unitPx) const {
+        size_t i = 0;
+        while (i < text.size() && (isdigit((unsigned char)text[i]) || text[i] == '.' || text[i] == '-')) i++;
+        if (i == 0 || i == text.size()) return {{text, COL_VALUE, numPx}};
+        return {{text.substr(0, i), COL_VALUE, numPx}, {text.substr(i), COL_DIM, unitPx}};
+    }
+    Span gap(float unitPx) const { return {"  ", COL_DIM, unitPx}; }
     Run tempSpans(float c, int red, float numPx, float unitPx) const {
         if (std::isnan(c)) return {};
         uint32_t col = COL_VALUE;
         if (bands) {
-            const int r = red, amber = int(std::lround(r * 0.88f));
-            col = c >= float(r) ? COL_TEMP_RED : c >= float(amber) ? COL_TEMP_AMBER : COL_TEMP_OK;
+            const int amber = int(std::lround(red * 0.88f));
+            col = c >= float(red) ? COL_TEMP_RED : c >= float(amber) ? COL_TEMP_AMBER : COL_TEMP_OK;
         }
         const float v = fahrenheit ? c * 9.0f / 5.0f + 32.0f : c;
         return {{std::to_string(int(std::lround(v))), col, numPx}, {fahrenheit ? "°F" : "°C", COL_DIM, unitPx}};
     }
+    Run gpuValues(const Snapshot &s, float px, float unitPx) const {
+        Run v = numUnit(num(s.gpu), "%", px, unitPx);
+        if (showGpuTemp) {
+            Run t = tempSpans(s.gpuTemp, redGpu, px, unitPx);
+            if (!t.empty()) { v.push_back(gap(unitPx)); append(v, t); }
+        }
+        v.push_back(gap(unitPx));
+        append(v, numUnit(num(s.gpuMhz), "MHz", px, unitPx));
+        return v;
+    }
+    Run cpuValues(const Snapshot &s, float px, float unitPx) const {
+        Run v = numUnit(num(s.cpu), "%", px, unitPx);
+        if (showCpuTemp) {
+            Run t = tempSpans(s.cpuTemp, redCpu, px, unitPx);
+            if (!t.empty()) { v.push_back(gap(unitPx)); append(v, t); }
+        }
+        v.push_back(gap(unitPx));
+        append(v, numUnit(num(s.cpuMhz), "MHz", px, unitPx));
+        return v;
+    }
+    // BAT row of Full/Mega: percent, battery temperature, watts.
+    bool batteryValues(const Snapshot &s, float px, float unitPx, Run &v) const {
+        bool any = false;
+        if (showBattery && s.bat >= 0) { append(v, numUnit(std::to_string(s.bat), "%", px, unitPx)); any = true; }
+        if (showBatteryTemp) {
+            Run t = tempSpans(s.batTemp, redBat, px, unitPx);
+            if (!t.empty()) { if (any) v.push_back(gap(unitPx)); append(v, t); any = true; }
+        }
+        if (showPower && s.watts > 0) { if (any) v.push_back(gap(unitPx)); append(v, numUnit(fmt1(s.watts), "W", px, unitPx)); any = true; }
+        return any;
+    }
+    void fpsRows(const FpsNow &f, float px, float unitPx, std::vector<HudRow> &rows) const {
+        Run v = numUnit(fpsText(f.fps), "FPS", px, unitPx);
+        v.push_back(gap(unitPx));
+        append(v, numUnit(fmt1(1000.0f / std::max(f.fps, 1.0f)), "ms", px, unitPx));
+        rows.push_back({{apiLabel(f), COL_FPS, px}, v});
+        rows.push_back({{"AVG", COL_LO, px}, numUnit(fmt1(f.avg), "FPS", px, unitPx)});
+        rows.push_back({{"1%", COL_LO, px}, numUnit(lowText(f.low1), "FPS", px, unitPx)});
+        rows.push_back({{"0.1%", COL_LO, px}, numUnit(lowText(f.low01), "FPS", px, unitPx)});
+        if (showLow001) rows.push_back({{"0.01%", COL_LO, px}, numUnit(lowText(f.low001), "FPS", px, unitPx)});
+    }
+
+    // FusionHudView.layoutColumn: a label column then values; returns (bottom, right).
+    std::pair<float, float> layoutColumn(const std::vector<HudRow> &rows, float x, float y0, float px, float lineGap, float lvGap) {
+        if (rows.empty()) return {y0, x};
+        float labelCol = 0;
+        for (const auto &r : rows) labelCol = std::max(labelCol, measure(r.label.text, px));
+        const float h = lineH(px);
+        float y = y0, right = x;
+        for (const auto &r : rows) {
+            const float baseline = y + ascent(px);
+            placeRun(x, baseline, {r.label});
+            right = std::max(right, placeRun(x + labelCol + lvGap, baseline, r.vals));
+            y += h + lineGap;
+        }
+        return {y - lineGap, right};
+    }
+
+    // FusionHudView.layoutWrap: " · "-separated fragments wrapped at maxWidth; returns (bottom, right).
+    std::pair<float, float> layoutWrap(const std::vector<Run> &frags, float x, float y0, float maxWidth, float px, float lineGap) {
+        if (frags.empty()) return {y0, x};
+        const float h = lineH(px), sepW = measure(" · ", px);
+        float cx = x, y = y0, right = x;
+        bool first = true;
+        for (const auto &frag : frags) {
+            const float w = runWidth(frag);
+            if (!first && (cx + sepW + w - x) > maxWidth) { y += h + lineGap; cx = x; first = true; }
+            if (!first) { placeRun(cx, y + ascent(px), {{" · ", COL_DIM, px}}); cx += sepW; }
+            cx = placeRun(cx, y + ascent(px), frag);
+            right = std::max(right, cx);
+            first = false;
+        }
+        return {y + h, right};
+    }
 
     void addSubtleClock(float pad, float centerX = -1) {
-        if (!cfg.on("showClock", true)) return;
+        if (!showClock) return;
         const float px = sp(9.5f);
         const std::string t = clockText();
         const float w = measure(t, px);
@@ -624,6 +883,207 @@ private:
         contentW = std::max(contentW, pad + w + pad);
     }
 
+    void build_full(const Snapshot &s, const FpsNow &f) {
+        const float rowPx = sp(12), unitPx = rowPx * 0.62f, pad = sp(10), lineGap = sp(4), lvGap = sp(8);
+        std::vector<HudRow> rows;
+        if (showGpuModel && !s.gpuName.empty()) rows.push_back({{"GPU", COL_GPU, rowPx}, {{s.gpuName, COL_VALUE, rowPx}}});
+        if (showGPU) rows.push_back({{"GPU", COL_GPU, rowPx}, gpuValues(s, rowPx, unitPx)});
+        if (showCPU) rows.push_back({{"CPU", COL_CPU, rowPx}, cpuValues(s, rowPx, unitPx)});
+        if (showVram && s.vram > 0) rows.push_back({{"VRAM", COL_VRAM, rowPx}, valueUnit(vramText(s.vram), rowPx, unitPx)});
+        if (showRAM && s.ramUsed >= 0) {
+            Run v = valueUnit(bytesGb(s.ramUsed), rowPx, unitPx);
+            v.push_back(gap(unitPx));
+            append(v, numUnit(std::to_string(int(std::lround(s.ramPct))), "%", rowPx, unitPx));
+            rows.push_back({{"RAM", COL_RAM, rowPx}, v});
+        }
+        {
+            Run v;
+            if (batteryValues(s, rowPx, unitPx, v)) rows.push_back({{"BAT", COL_BAT, rowPx}, v});
+        }
+        if (showFPS) fpsRows(f, rowPx, unitPx, rows);
+
+        float labelCol = 0;
+        for (const auto &r : rows) labelCol = std::max(labelCol, measure(r.label.text, rowPx));
+        auto [y, maxRight] = layoutColumn(rows, pad, pad, rowPx, lineGap, lvGap);
+        if (!rows.empty()) y += lineGap;
+        if (showFPS && showGraph) {
+            const float ftPx = unitPx * 1.15f, h = lineH(rowPx);
+            placeRun(pad, y + ascent(rowPx), {{"Frametime", COL_FPS, ftPx}});
+            const std::string stat = "min:" + fmt1(f.minMs) + " max:" + fmt1(f.maxMs);
+            const float statX = pad + std::max(labelCol, measure("Frametime", ftPx)) + lvGap;
+            maxRight = std::max(maxRight, placeRun(statX, y + ascent(rowPx), {{stat, COL_DIM, unitPx}}));
+            y += h + lineGap;
+            const float gh = sp(22), right = std::max(maxRight, pad + sp(160));
+            graphRect = true;
+            gx0 = pad; gy0 = y; gx1 = right; gy1 = y + gh;
+            maxRight = std::max(maxRight, right);
+            y += gh;
+        }
+        contentW = maxRight + pad;
+        contentH = y + pad;
+        addSubtleClock(pad);
+    }
+
+    void build_tiles(const Snapshot &s, const FpsNow &f) {
+        const float keyPx = sp(10), valPx = sp(18), subPx = sp(10), unitPx = sp(11);
+        const float pad = sp(9), innerPad = sp(8), tileGap = sp(6), lineGap = sp(4);
+        struct Tile {
+            std::string key;
+            uint32_t keyColor;
+            Run value;
+            std::string sub;
+            bool wide;
+        };
+        std::vector<Tile> list;
+        if (showFPS) {
+            list.push_back({"FPS", COL_FPS, {{fpsText(f.fps), COL_VALUE, valPx}}, fmt1(f.avg) + " avg · " + lowText(f.low1) + " 1%", false});
+            list.push_back({"FRAME", COL_DIM, numUnit(fmt1(1000.0f / std::max(f.fps, 1.0f)), "ms", valPx, unitPx),
+                            fmt1(f.minMs) + " – " + fmt1(f.maxMs), false});
+        }
+        auto deg = [&](float c) {
+            const float v = fahrenheit ? c * 9.0f / 5.0f + 32.0f : c;
+            return std::to_string(int(std::lround(v))) + (fahrenheit ? "°F" : "°C");
+        };
+        if (showGPU)
+            list.push_back({"GPU", COL_GPU, numUnit(num(s.gpu), "%", valPx, unitPx),
+                            showGpuTemp && !std::isnan(s.gpuTemp) ? deg(s.gpuTemp) : (s.gpuMhz > 0 ? std::to_string(s.gpuMhz) + "MHz" : ""), false});
+        if (showCPU) {
+            std::string sub;
+            if (showCpuTemp && !std::isnan(s.cpuTemp)) sub = deg(s.cpuTemp);
+            if (s.cpuMhz > 0) sub += (sub.empty() ? "" : " · ") + std::to_string(s.cpuMhz);
+            list.push_back({"CPU", COL_CPU, numUnit(num(s.cpu), "%", valPx, unitPx), sub, false});
+        }
+        if (showVram && s.vram > 0) list.push_back({"VRAM", COL_VRAM, valueUnit(vramText(s.vram), valPx, unitPx), "", false});
+        if (showRAM && s.ramUsed >= 0)
+            list.push_back({"RAM", COL_RAM, numUnit(std::to_string(int(std::lround(s.ramPct))), "%", valPx, unitPx),
+                            bytesGb(s.ramUsed) + " / " + bytesGb(s.ramTotal), false});
+        if (apiLabel(f) != "FPS") list.push_back({"API", COL_FPS, {{f.engine, COL_VALUE, valPx}}, "", false});
+        if (showGpuModel && !s.gpuName.empty()) list.push_back({"GPU", COL_GPU, {{s.gpuName, COL_VALUE, valPx}}, "", true});
+        {
+            Run parts;
+            bool any = false;
+            if (showBattery && s.bat >= 0) { append(parts, numUnit(std::to_string(s.bat), "%", valPx, unitPx)); any = true; }
+            if (showBatteryTemp && !std::isnan(s.batTemp)) {
+                if (any) parts.push_back({" · ", COL_DIM, subPx});
+                append(parts, tempSpans(s.batTemp, redBat, valPx, unitPx));
+                any = true;
+            }
+            if (showPower && s.watts > 0) {
+                if (any) parts.push_back({" · ", COL_DIM, subPx});
+                append(parts, numUnit(fmt1(s.watts), "W", valPx, unitPx));
+                any = true;
+            }
+            if (any) list.push_back({"BAT", COL_BAT, parts, "", true});
+        }
+        if (list.empty()) return;
+
+        const float keyH = lineH(keyPx), valH = lineH(valPx), subH = lineH(subPx);
+        auto tileW = [&](const Tile &t) {
+            return std::max(std::max(measure(t.key, keyPx), runWidth(t.value)), t.sub.empty() ? 0.0f : measure(t.sub, subPx)) + innerPad * 2;
+        };
+        float normalW = 0;
+        for (const auto &t : list) if (!t.wide) normalW = std::max(normalW, tileW(t));
+        if (normalW == 0) for (const auto &t : list) normalW = std::max(normalW, tileW(t) / 2.0f);
+        for (const auto &t : list) if (t.wide) normalW = std::max(normalW, (tileW(t) - tileGap) / 2.0f);
+        const float tileH = innerPad * 2 + keyH + lineGap + valH + lineGap + subH;
+        const float fullW = normalW * 2 + tileGap;
+        auto place = [&](const Tile &t, float tx, float ty, float tw) {
+            tiles.push_back(ImVec4(tx, ty, tx + tw, ty + tileH));
+            placeRun(tx + innerPad, ty + innerPad + ascent(keyPx), {{t.key, t.keyColor, keyPx}});
+            placeRun(tx + innerPad, ty + innerPad + keyH + lineGap + ascent(valPx), t.value);
+            if (!t.sub.empty()) placeRun(tx + innerPad, ty + innerPad + keyH + lineGap + valH + lineGap + ascent(subPx), {{t.sub, COL_DIM, subPx}});
+        };
+        float x = pad, y = pad;
+        int col = 0;
+        for (const auto &t : list) {
+            if (t.wide) {
+                if (col != 0) { y += tileH + tileGap; col = 0; x = pad; }
+                place(t, pad, y, fullW);
+                y += tileH + tileGap;
+            } else {
+                place(t, x, y, normalW);
+                col++;
+                x += normalW + tileGap;
+                if (col == 2) { col = 0; x = pad; y += tileH + tileGap; }
+            }
+        }
+        if (col != 0) y += tileH + tileGap;
+        contentW = pad + fullW + pad;
+        contentH = y + (pad - tileGap);
+        addSubtleClock(pad);
+    }
+
+    void build_mega(const Snapshot &s, const FpsNow &f) {
+        const float rowPx = sp(11.5f), unitPx = rowPx * 0.62f, bandPx = sp(9.5f);
+        const float pad = sp(10), lineGap = sp(3.5f), lvGap = sp(7), gutter = sp(16);
+        std::vector<HudRow> left, right;
+        if (showGpuModel && !s.gpuName.empty()) left.push_back({{"GPU", COL_GPU, rowPx}, {{s.gpuName, COL_VALUE, rowPx}}});
+        if (showGPU) left.push_back({{"GPU", COL_GPU, rowPx}, gpuValues(s, rowPx, unitPx)});
+        if (showCPU) left.push_back({{"CPU", COL_CPU, rowPx}, cpuValues(s, rowPx, unitPx)});
+        if (showPerCore) {
+            const size_t n = std::max(s.corePct.size(), s.coreMhz.size());
+            for (size_t i = 0; i < n; i++) {
+                Run v = numUnit(i < s.corePct.size() ? num(s.corePct[i]) : "", "%", rowPx, unitPx);
+                v.push_back(gap(unitPx));
+                append(v, numUnit(i < s.coreMhz.size() && s.coreMhz[i] > 0 ? std::to_string(s.coreMhz[i]) : "", "MHz", rowPx, unitPx));
+                left.push_back({{"C" + std::to_string(i), COL_CPU, rowPx}, v});
+            }
+        }
+        if (showVram && s.vram > 0) right.push_back({{"VRAM", COL_VRAM, rowPx}, valueUnit(vramText(s.vram), rowPx, unitPx)});
+        if (showRAM && s.ramUsed >= 0) {
+            Run v = valueUnit(bytesGb(s.ramUsed), rowPx, unitPx);
+            v.push_back({"/", COL_DIM, unitPx});
+            append(v, valueUnit(bytesGb(s.ramTotal), rowPx, unitPx));
+            v.push_back(gap(unitPx));
+            append(v, numUnit(std::to_string(int(std::lround(s.ramPct))), "%", rowPx, unitPx));
+            right.push_back({{"RAM", COL_RAM, rowPx}, v});
+        }
+        if (showSwap && s.swapUsed >= 0) {
+            Run v = valueUnit(bytesGb(s.swapUsed), rowPx, unitPx);
+            v.push_back({"/", COL_DIM, unitPx});
+            append(v, valueUnit(bytesGb(s.swapTotal), rowPx, unitPx));
+            right.push_back({{"SWP", COL_RAM, rowPx}, v});
+        }
+        if (showNet && s.netDown >= 0) {
+            right.push_back({{"NET", COL_FPS, rowPx},
+                             {{"↓", COL_DIM, unitPx}, {std::to_string(s.netDown / 1024), COL_VALUE, rowPx},
+                              {" ↑", COL_DIM, unitPx}, {std::to_string(s.netUp / 1024), COL_VALUE, rowPx}, {"KB/s", COL_DIM, unitPx}}});
+        }
+        {
+            Run v;
+            if (batteryValues(s, rowPx, unitPx, v)) right.push_back({{"BAT", COL_BAT, rowPx}, v});
+        }
+        if (showFPS) fpsRows(f, rowPx, unitPx, right);
+
+        auto [leftBottom, leftRight] = layoutColumn(left, pad, pad, rowPx, lineGap, lvGap);
+        const float rightX = left.empty() ? pad : leftRight + gutter;
+        auto [rightBottom, rightRight] = layoutColumn(right, rightX, pad, rowPx, lineGap, lvGap);
+        float y = std::max(leftBottom, rightBottom), maxRight = std::max(leftRight, rightRight);
+
+        std::vector<Run> band;
+        const std::string res = resolutionText(f);
+        if (showResolution && !res.empty()) band.push_back({{"RES ", COL_DIM, bandPx}, {res, COL_VALUE, bandPx}});
+        if (showProton && !s.proton.empty()) band.push_back({{s.proton, COL_VRAM, bandPx}});
+        if (showSession) band.push_back({{"elapsed ", COL_DIM, bandPx}, {elapsedText(), COL_VALUE, bandPx}});
+        if (!band.empty()) {
+            y += sp(4);
+            auto [bBottom, bRight] = layoutWrap(band, pad, y, std::max(maxRight - pad, sp(180)), bandPx, lineGap);
+            y = bBottom;
+            maxRight = std::max(maxRight, bRight);
+        }
+        if (showGraph) {
+            y += sp(3);
+            const float gh = sp(22), gr = std::max(maxRight, pad + sp(220));
+            graphRect = true;
+            gx0 = pad; gy0 = y; gx1 = gr; gy1 = y + gh;
+            maxRight = std::max(maxRight, gr);
+            y += gh;
+        }
+        contentW = maxRight + pad;
+        contentH = y + pad;
+        addSubtleClock(pad);
+    }
+
     void build_pill(const Snapshot &s, const FpsNow &f) {
         capsule = true;
         const float bigPx = sp(30), bigUnitPx = bigPx * 0.36f, stkPx = sp(11.5f);
@@ -632,30 +1092,30 @@ private:
         Run left = {{fpsText(f.fps), COL_VALUE, bigPx}, {"fps", COL_DIM, bigUnitPx}};
 
         std::vector<Run> stack;
-        if (cfg.on("showGpuModel", true) && !s.gpuName.empty()) stack.push_back({{s.gpuName, COL_DIM, stkPx}});
+        if (showGpuModel && !s.gpuName.empty()) stack.push_back({{s.gpuName, COL_DIM, stkPx}});
         {
             Run l;
-            if (cfg.on("showGPULoad", true)) l.push_back({"GPU " + (s.gpu >= 0 ? std::to_string(s.gpu) : std::string("—")) + "%", COL_GPU, stkPx});
-            if (cfg.on("showCPUUsage", cfg.on("showCPULoad", true))) {
+            if (showGPU) l.push_back({"GPU " + (s.gpu >= 0 ? std::to_string(s.gpu) : std::string("—")) + "%", COL_GPU, stkPx});
+            if (showCPU) {
                 if (!l.empty()) l.push_back({" · ", COL_DIM, stkPx});
                 l.push_back({"CPU " + (s.cpu >= 0 ? std::to_string(s.cpu) : std::string("—")) + "%", COL_CPU, stkPx});
             }
             if (!l.empty()) stack.push_back(l);
         }
-        if (cfg.on("showRAM", true) && s.ramPct >= 0) {
+        if (showRAM && s.ramPct >= 0) {
             Run l = {{"RAM " + std::to_string(int(std::lround(s.ramPct))) + "%", COL_RAM, stkPx}};
-            if (cfg.on("showBatteryTemp", false) && !std::isnan(s.batTemp)) {
+            if (showBatteryTemp && !std::isnan(s.batTemp)) {
                 l.push_back({" · ", COL_DIM, stkPx});
                 l.push_back({"BAT ", COL_BAT, stkPx});
-                for (auto &sp_ : tempSpans(s.batTemp, redBat, stkPx, stkPx * 0.62f)) l.push_back(sp_);
+                append(l, tempSpans(s.batTemp, redBat, stkPx, stkPx * 0.62f));
             }
             stack.push_back(l);
         }
-        if (cfg.on("showBattery", true) || cfg.on("showPower", true)) {
+        if (showBattery || showPower) {
             Run l;
             bool any = false;
-            if (cfg.on("showBattery", true) && s.bat >= 0) { l.push_back({"BAT " + std::to_string(s.bat) + "%", COL_BAT, stkPx}); any = true; }
-            if (cfg.on("showPower", true) && s.watts > 0) {
+            if (showBattery && s.bat >= 0) { l.push_back({"BAT " + std::to_string(s.bat) + "%", COL_BAT, stkPx}); any = true; }
+            if (showPower && s.watts > 0) {
                 if (any) l.push_back({" · ", COL_DIM, stkPx});
                 l.push_back({fmt1(s.watts) + "W", COL_DIM, stkPx});
                 any = true;
@@ -664,9 +1124,9 @@ private:
         }
         {
             Run l = {{fmt1(1000.0f / std::max(f.fps, 1.0f)) + "ms", COL_DIM, stkPx}};
-            if (cfg.on("showVram", true) && s.vramGiB >= 0) {
+            if (showVram && s.vram > 0) {
                 l.push_back({" · ", COL_DIM, stkPx});
-                l.push_back({fmt1(s.vramGiB) + "G vram", COL_DIM, stkPx});
+                l.push_back({vramText(s.vram) + " vram", COL_DIM, stkPx});
             }
             stack.push_back(l);
         }
@@ -734,21 +1194,20 @@ private:
         Run big = {{fpsText(f.fps), COL_VALUE, bigPx}, {"fps", COL_DIM, bigUnitPx}};
         Run sub = {{"1% ", COL_DIM, subPx}, {lowText(f.low1), COL_FPS, subPx},
                    {"  ·  0.1% ", COL_DIM, subPx}, {lowText(f.low01), COL_FPS, subPx}};
-        if (cfg.on("showLow001", true)) {
+        if (showLow001) {
             sub.push_back({"  ·  0.01% ", COL_DIM, subPx});
             sub.push_back({lowText(f.low001), COL_FPS, subPx});
         }
-        const bool graph = cfg.on("showFPSGraph", false);
         const float bigW = runWidth(big), bigH = lineH(bigPx), subW = runWidth(sub), subH = lineH(subPx);
         const float gw = sp(120), gh = sp(22);
-        const float inner = std::max(std::max(bigW, subW), graph ? gw : 0.0f);
+        const float inner = std::max(std::max(bigW, subW), showGraph ? gw : 0.0f);
         contentW = inner + pad * 2;
         float y = pad;
         placeRun(pad + (inner - bigW) / 2.0f, y + ascent(bigPx), big);
         y += bigH + lineGap;
         placeRun(pad + (inner - subW) / 2.0f, y + ascent(subPx), sub);
         y += subH + lineGap;
-        if (graph) {
+        if (showGraph) {
             graphRect = true;
             gx0 = pad + (inner - gw) / 2.0f;
             gy0 = y;
@@ -757,14 +1216,14 @@ private:
             y += gh;
         }
         contentH = y + pad;
-        std::string footer = cfg.on("showEngine", true) && apiLabel(f) != "FPS" ? apiLabel(f) : "";
+        const std::string footer = apiLabel(f) != "FPS" ? apiLabel(f) : "";
         if (!footer.empty()) {
             const float apiPx = sp(9.5f);
             const float footerTop = contentH - pad;
             glyphs.push_back({pad, footerTop + ascent(apiPx), footer, blend(COL_DIM), apiPx});
-            const float clockW = cfg.on("showClock", true) ? measure(clockText(), apiPx) : 0;
+            const float clockW = showClock ? measure(clockText(), apiPx) : 0;
             contentW = std::max(contentW, pad + measure(footer, apiPx) + sp(12) + clockW + pad);
-            if (!cfg.on("showClock", true)) contentH = footerTop + lineH(apiPx) + pad * 0.5f;
+            if (!showClock) contentH = footerTop + lineH(apiPx) + pad * 0.5f;
         }
         addSubtleClock(pad);
     }
@@ -786,7 +1245,7 @@ ImFont *load_font(ImGuiIO &io) {
     const char *candidates[] = {"/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
                                 "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
                                 "/usr/share/fonts/TTF/DejaVuSansMono.ttf"};
-    static const ImWchar ranges[] = {0x0020, 0x00FF, 0x2014, 0x2014, 0x2022, 0x2022, 0x2192, 0x2192, 0};
+    static const ImWchar ranges[] = {0x0020, 0x00FF, 0x2010, 0x2027, 0x2190, 0x2193, 0};  // Latin-1, dashes and bullets, arrows
     for (const char *p : candidates) {
         if (access(p, R_OK) == 0) {
             ImFontConfig fc;
@@ -871,8 +1330,9 @@ int main(int argc, char **argv) {
     std::thread(frame_reader).detach();
 
     Metrics metrics;
-    Snapshot snap = metrics.snapshot();
+    Snapshot snap = metrics.snapshot(0);
     uint64_t lastMetrics = 0, lastConfigCheck = 0;
+    const uint64_t startNs = now_ns();
     time_t configMtime = -1;
 
     while (!g_quit && !glfwWindowShouldClose(window)) {
@@ -890,13 +1350,13 @@ int main(int argc, char **argv) {
         }
         if (t - lastMetrics > 1000000000ull) {
             lastMetrics = t;
-            snap = metrics.snapshot();
+            snap = metrics.snapshot(fps_now().pid);
         }
 
         int fbW, fbH;
         glfwGetFramebufferSize(window, &fbW, &fbH);
         const float screenScale = float(std::max(fbH, 1)) / 1080.0f;
-        hud.build(snap, fps_now(), screenScale);
+        hud.build(snap, fps_now(), screenScale, float(t - startNs) / 1e9f);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
