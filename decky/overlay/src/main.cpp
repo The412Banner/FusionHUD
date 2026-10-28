@@ -261,6 +261,10 @@ struct Snapshot {
     bool charging = false;
 };
 
+// DroidDeck's guest gets its own copies of these (session parts in the app: BatteryComponent writes
+// power_supply/BAT1, HwmonComponent hwmon/*, GpuStatsComponent kgsl-3d0/{gpu_busy_percentage,clock_mhz,temp},
+// GpuMemComponent /run/droiddeck-hud/gpu-mem, CpuStatComponent /proc/stat). Android's own paths are the
+// fallbacks, so the same build also reads a plain Android/Linux system.
 class Metrics {
 public:
     Snapshot snapshot() {
@@ -268,11 +272,9 @@ public:
         s.gpuName = gpu_name();
         s.cpu = cpu_percent();
         s.gpu = gpu_percent();
-        long long mhz;
-        if (read_long("/sys/class/kgsl/kgsl-3d0/gpuclk", mhz) && mhz > 0) s.gpuMhz = int(mhz / 1000000);
+        s.gpuMhz = gpu_mhz();
         ram(s);
-        long long v;
-        if (read_long("/sys/class/kgsl/kgsl-3d0/page_alloc", v) && v > 0) s.vramGiB = float(double(v) / (1024.0 * 1024.0 * 1024.0));
+        s.vramGiB = vram_gib();
         battery(s);
         temps(s);
         return s;
@@ -280,8 +282,8 @@ public:
 
 private:
     unsigned long long prevIdle = 0, prevTotal = 0;
-    bool zonesFound = false;
-    std::string cpuZone, gpuZone;
+    bool tempsFound = false;
+    std::string cpuTempFile, gpuTempFile, batteryDir;
 
     static std::string gpu_name() {
         // As FusionHUD's GPUInformation.extractModelName: "zink Vulkan 1.4(Turnip Adreno (TM) 750 ...)" → "Adreno 750".
@@ -314,11 +316,27 @@ private:
 
     static int gpu_percent() {
         long long v;
+        // "  3 %" in both Android's file and DroidDeck's copy; strtoll skips the spaces and stops at '%'.
         if (read_long("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", v)) return int(std::clamp<long long>(v, 0, 100));
         std::string l = read_line("/sys/class/kgsl/kgsl-3d0/gpubusy");
         long long busy, total;
         if (sscanf(l.c_str(), "%lld %lld", &busy, &total) == 2 && total > 0) return int(std::clamp<long long>(busy * 100 / total, 0, 100));
         if (read_long("/sys/class/devfreq/gpu/load", v)) return int(std::clamp<long long>(v, 0, 100));
+        return -1;
+    }
+
+    static int gpu_mhz() {
+        long long v;
+        if (read_long("/sys/class/kgsl/kgsl-3d0/clock_mhz", v) && v > 0) return int(v);
+        if (read_long("/sys/class/kgsl/kgsl-3d0/gpuclk", v) && v > 0) return int(v / 1000000);
+        if (read_long("/sys/class/kgsl/kgsl-3d0/cur_freq", v) && v > 0) return int(v > 100000 ? v / 1000000 : v);
+        return -1;
+    }
+
+    static float vram_gib() {
+        long long v;
+        if (read_long("/run/droiddeck-hud/gpu-mem", v) && v > 0) return float(double(v) / (1024.0 * 1024.0 * 1024.0));
+        if (read_long("/sys/class/kgsl/kgsl/page_alloc", v) && v > 0) return float(double(v) / (1024.0 * 1024.0 * 1024.0));
         return -1;
     }
 
@@ -338,56 +356,93 @@ private:
         }
     }
 
-    static void battery(Snapshot &s) {
-        const std::string b = "/sys/class/power_supply/battery/";
+    // The first power supply whose type is Battery: BAT1 in DroidDeck, "battery" on Android.
+    std::string find_battery() {
+        DIR *d = opendir("/sys/class/power_supply");
+        if (!d) return "";
+        std::string found;
+        while (dirent *e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            const std::string dir = std::string("/sys/class/power_supply/") + e->d_name + "/";
+            if (read_line(dir + "type") == "Battery") { found = dir; break; }
+        }
+        closedir(d);
+        return found;
+    }
+
+    void battery(Snapshot &s) {
         long long v;
+        if (batteryDir.empty() || !read_long(batteryDir + "capacity", v)) batteryDir = find_battery();
+        if (batteryDir.empty()) return;
+        const std::string &b = batteryDir;
         if (read_long(b + "capacity", v)) s.bat = int(v);
         if (read_long(b + "temp", v)) s.batTemp = float(v) / 10.0f;
+        // current × voltage, as FusionHUD: Android's own power_now is not in µW on every kernel (the Pocket FIT
+        // reports 63702476 at about 8 W). DroidDeck's BAT1 power_now is this same product.
         long long cur, volt;
-        if (read_long(b + "current_now", cur) && read_long(b + "voltage_now", volt)) {
+        if (read_long(b + "current_now", cur) && read_long(b + "voltage_now", volt) && cur != 0) {
             double i = double(std::llabs(cur));
-            if (i > 0 && i < 20000) i *= 1000.0;  // mA on some kernels, µA on most
+            if (i < 20000) i *= 1000.0;  // mA on some kernels, µA on most
             s.watts = float(i * double(volt) / 1e12);
+        } else if (read_long(b + "power_now", v) && v != 0) {
+            s.watts = float(double(std::llabs(v)) / 1e6);
         }
         std::string st = read_line(b + "status");
         s.charging = st == "Charging" || st == "Full";
     }
 
-    static float read_zone(const std::string &zone) {
+    static float read_milli(const std::string &file) {
         long long v;
-        if (zone.empty() || !read_long(zone + "/temp", v)) return NAN;
+        if (file.empty() || !read_long(file, v)) return NAN;
         float c = v > 1000 ? float(v) / 1000.0f : float(v);
         return (c >= 1.0f && c <= 150.0f) ? c : NAN;
     }
 
-    void find_zones() {
-        zonesFound = true;
+    // hwmon first (DroidDeck: cpu0_thermal, gpuss0_thermal), then KGSL's own temp, then thermal zones ranked
+    // as FusionHUD's HudMetrics does.
+    void find_temps() {
+        tempsFound = true;
         int cpuRank = 99, gpuRank = 99;
-        DIR *d = opendir("/sys/class/thermal");
-        if (!d) return;
-        while (dirent *e = readdir(d)) {
-            if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
-            const std::string zone = std::string("/sys/class/thermal/") + e->d_name;
-            std::string type = read_line(zone + "/type");
-            for (auto &ch : type) ch = char(tolower(ch));
+        auto offer = [&](const std::string &type, const std::string &file) {
+            std::string t = type;
+            for (auto &ch : t) ch = char(tolower(ch));
             int c = 99, g = 99;
-            if (type == "cpu-silicon") c = 0;
-            else if (type.rfind("cpu-0", 0) == 0) c = 1;
-            else if (type.find("cpu") != std::string::npos && type.find("gpu") == std::string::npos) c = 2;
-            else if (type.find("soc") != std::string::npos) c = 3;
-            if (type == "gpu-silicon") g = 0;
-            else if (type.find("gpuss") != std::string::npos) g = 1;
-            else if (type.find("gpu") != std::string::npos) g = 2;
-            if (c < cpuRank && !std::isnan(read_zone(zone))) { cpuRank = c; cpuZone = zone; }
-            if (g < gpuRank && !std::isnan(read_zone(zone))) { gpuRank = g; gpuZone = zone; }
+            if (t == "cpu-silicon") c = 0;
+            else if (t.rfind("cpu-0", 0) == 0 || t.rfind("cpu0", 0) == 0) c = 1;
+            else if (t.find("cpu") != std::string::npos && t.find("gpu") == std::string::npos) c = 2;
+            else if (t.find("soc") != std::string::npos) c = 3;
+            if (t == "gpu-silicon") g = 0;
+            else if (t.find("gpuss") != std::string::npos) g = 1;
+            else if (t.find("gpu") != std::string::npos) g = 2;
+            if (c < cpuRank && !std::isnan(read_milli(file))) { cpuRank = c; cpuTempFile = file; }
+            if (g < gpuRank && !std::isnan(read_milli(file))) { gpuRank = g; gpuTempFile = file; }
+        };
+        if (DIR *d = opendir("/sys/class/hwmon")) {
+            while (dirent *e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                const std::string dir = std::string("/sys/class/hwmon/") + e->d_name;
+                offer(read_line(dir + "/name"), dir + "/temp1_input");
+            }
+            closedir(d);
         }
-        closedir(d);
+        if (gpuRank > 1 && !std::isnan(read_milli("/sys/class/kgsl/kgsl-3d0/temp"))) {
+            gpuRank = 1;
+            gpuTempFile = "/sys/class/kgsl/kgsl-3d0/temp";
+        }
+        if (DIR *d = opendir("/sys/class/thermal")) {
+            while (dirent *e = readdir(d)) {
+                if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
+                const std::string zone = std::string("/sys/class/thermal/") + e->d_name;
+                offer(read_line(zone + "/type"), zone + "/temp");
+            }
+            closedir(d);
+        }
     }
 
     void temps(Snapshot &s) {
-        if (!zonesFound) find_zones();
-        s.cpuTemp = read_zone(cpuZone);
-        s.gpuTemp = read_zone(gpuZone);
+        if (!tempsFound) find_temps();
+        s.cpuTemp = read_milli(cpuTempFile);
+        s.gpuTemp = read_milli(gpuTempFile);
     }
 };
 
