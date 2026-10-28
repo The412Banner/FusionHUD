@@ -103,16 +103,14 @@ class DemoActivity : AppCompatActivity() {
             )
         )
 
+        // Full-screen layer: dragging moves the HUD with setX/setY inside its parent, so a parent the size of
+        // the HUD clipped it as soon as it moved.
         overlayContainer = FrameLayout(this)
         root.addView(
             overlayContainer,
             FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                topMargin = dp(24)
-                leftMargin = dp(24)
-            }
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
         )
 
         hud = FusionHudView(this).apply {
@@ -131,7 +129,16 @@ class DemoActivity : AppCompatActivity() {
                 runOnUiThread { lockButton.text = if (locked) "Lock: on" else "Lock: off" }
             }
         }
-        overlayContainer.addView(hud)
+        overlayContainer.addView(
+            hud,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                topMargin = dp(24)
+                leftMargin = dp(24)
+            }
+        )
 
         root.addView(buildControlBar())
 
