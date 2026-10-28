@@ -1,0 +1,65 @@
+name: Decky plugin
+
+on:
+  push:
+    paths: [ 'decky/**', '.github/workflows/decky.yml' ]
+  pull_request:
+    paths: [ 'decky/**', '.github/workflows/decky.yml' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The overlay runs in DroidDeck's Arch Linux ARM guest (glibc 2.43); Ubuntu 24.04's glibc 2.39 is older, so it runs there.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libxext-dev libgl-dev
+
+      - name: Build the overlay
+        run: |
+          cmake -S decky/overlay -B build/overlay -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/overlay
+          strip build/overlay/fusionhud-overlay
+
+      - name: Check the overlay's dependencies
+        run: |
+          file build/overlay/fusionhud-overlay
+          readelf -d build/overlay/fusionhud-overlay | grep NEEDED
+          echo "newest glibc symbol: $(objdump -T build/overlay/fusionhud-overlay | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build the panel
+        working-directory: decky
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Package
+        run: |
+          P=out/FusionHUD
+          mkdir -p $P/dist $P/bin $P/presets
+          cp decky/plugin.json decky/package.json decky/main.py decky/README.md $P/
+          cp LICENSE $P/
+          cp decky/dist/index.js $P/dist/
+          cp decky/presets/fusion-presets.conf $P/presets/
+          install -m 755 build/overlay/fusionhud-overlay $P/bin/
+          (cd out && zip -r -X FusionHUD.zip FusionHUD)
+          unzip -l out/FusionHUD.zip
+          sha256sum out/FusionHUD.zip
+
+      - name: Upload the plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: FusionHUD-decky-${{ github.sha }}
+          path: out/FusionHUD.zip
+          if-no-files-found: error
