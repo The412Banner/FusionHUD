@@ -32,8 +32,9 @@ const setHud = callable<[key: string, value: string], State>("set_hud");
 const resetHud = callable<[], State>("reset_hud");
 
 // FusionSize.supportedChips() (FusionHudModels.kt), minus the switches a size never draws: FPS on Pill and
-// Minimal (always shown there), graph and 0.01 % low on Tiles. Engine, Wrapper and DX version stay hidden:
-// DroidDeck's gamescope reports no engine and there is no wrapper, so nothing could fill them.
+// Minimal (always shown there), graph and 0.01 % low on Tiles. Wrapper and DX version stay hidden: DroidDeck
+// has no wrapper and nothing reports the DXVK/VKD3D version. Engine is gamescope's engine name ("DXVK" in
+// Dead Cells), so it stays.
 const SIZES = [  // FusionSize order, as Bannerlator's size picker
   { data: "full", label: "Full" },
   { data: "tiles", label: "Tiles" },
@@ -41,11 +42,11 @@ const SIZES = [  // FusionSize order, as Bannerlator's size picker
   { data: "minimal", label: "Minimal" },
   { data: "mega", label: "Mega" }
 ];
-const STANDARD = ["FPS", "FPS graph", "GPU model", "GPU", "GPU temp", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "0.01% low", "FPS .1", "Clock"];
+const STANDARD = ["FPS", "FPS graph", "GPU model", "GPU", "GPU temp", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "0.01% low", "FPS .1", "Engine", "Clock"];
 const SIZE_CHIPS: Record<string, string[]> = {
-  minimal: ["FPS graph", "0.01% low", "FPS .1", "Clock"],
+  minimal: ["FPS graph", "0.01% low", "FPS .1", "Engine", "Clock"],
   // The Pill also draws battery temperature and watts, so their switches are listed here too.
-  pill: ["GPU model", "GPU", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "FPS .1", "Clock"],
+  pill: ["GPU model", "GPU", "CPU", "RAM", "VRAM", "Temp", "Battery", "Power", "FPS .1", "Engine", "Clock"],
   full: STANDARD,
   tiles: STANDARD.filter((c) => c !== "FPS graph" && c !== "0.01% low"),
   mega: [...STANDARD, "Per-core", "Swap", "Network", "Resolution", "Proton", "Session"]
