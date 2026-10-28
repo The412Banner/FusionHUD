@@ -1,6 +1,6 @@
 {
   "name": "fusionhud-decky",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "FusionHUD look for Steam's performance overlay (MangoHud presets), for DroidDeck's Decky Loader",
   "type": "module",
   "scripts": {
@@ -10,7 +10,13 @@
     "type": "git",
     "url": "git+https://github.com/The412Banner/FusionHUD.git"
   },
-  "keywords": ["decky", "plugin", "mangohud", "fusionhud", "droiddeck"],
+  "keywords": [
+    "decky",
+    "plugin",
+    "mangohud",
+    "fusionhud",
+    "droiddeck"
+  ],
   "author": "The412Banner",
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/The412Banner/FusionHUD",
